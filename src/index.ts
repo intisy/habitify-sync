@@ -1,4 +1,4 @@
-import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus } from "./state";
+import { readJson, STATE_KEYS, type SourceStatus } from "./state";
 import { SOURCES } from "./sources/registry";
 import { exchangeStravaCode } from "./sources/strava";
 import type { Env } from "./sources/types";
@@ -31,16 +31,6 @@ async function handleStatus(env: Env): Promise<Response> {
     }
   }
   return Response.json(statuses);
-}
-
-async function handleAmazonCookies(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json().catch(() => null)) as { cookie?: unknown } | null;
-  if (!body || typeof body.cookie !== "string" || body.cookie.length === 0) {
-    return Response.json({ error: 'expected body {"cookie": "<cookie header string>"}' }, { status: 400 });
-  }
-  const cookies: AmazonCookies = { cookie: body.cookie, updatedAt: new Date().toISOString() };
-  await writeJson(env.STATE, STATE_KEYS.amazonCookies, cookies);
-  return new Response(null, { status: 204 });
 }
 
 async function handleStravaAuthorize(request: Request, env: Env): Promise<Response> {
@@ -94,8 +84,6 @@ export async function handleFetch(request: Request, env: Env, fetchFn: typeof fe
       return Response.json(await runSync(env, SOURCES, new Date(), fetchFn, url.searchParams.get("source") ?? undefined));
     case "GET /status":
       return handleStatus(env);
-    case "PUT /state/amazon-cookies":
-      return handleAmazonCookies(request, env);
     case "GET /strava/authorize":
       return handleStravaAuthorize(request, env);
     default:

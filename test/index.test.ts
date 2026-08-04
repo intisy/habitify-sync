@@ -1,7 +1,7 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker, { handleFetch } from "../src/index";
-import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus, type StravaTokens } from "../src/state";
+import { readJson, STATE_KEYS, writeJson, type SourceStatus, type StravaTokens } from "../src/state";
 import type { Env } from "../src/sources/types";
 
 const authedEnv: Env = { ...env, ADMIN_TOKEN: "secret-token", HABITIFY_API_KEY: "habitify-key" };
@@ -46,29 +46,6 @@ describe("GET /status", () => {
     const body = (await response.json()) as Record<string, SourceStatus | null>;
     expect("strava" in body).toBe(true);
     expect(body.strava).toBeNull();
-  });
-});
-
-describe("PUT /state/amazon-cookies", () => {
-  it("stores the cookie string with a timestamp", async () => {
-    const response = await request("/state/amazon-cookies", {
-      method: "PUT",
-      headers: { ...bearer, "Content-Type": "application/json" },
-      body: JSON.stringify({ cookie: "session-id=abc; at-main=def" }),
-    });
-    expect(response.status).toBe(204);
-    const stored = await readJson<AmazonCookies>(env.STATE, STATE_KEYS.amazonCookies);
-    expect(stored?.cookie).toBe("session-id=abc; at-main=def");
-    expect(stored?.updatedAt).toBeTruthy();
-  });
-
-  it("rejects a body without a cookie string", async () => {
-    const response = await request("/state/amazon-cookies", {
-      method: "PUT",
-      headers: { ...bearer, "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    expect(response.status).toBe(400);
   });
 });
 

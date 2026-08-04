@@ -10,7 +10,6 @@ enabled = true
 
 [vars]
 TIMEZONE = "Europe/Berlin"
-HABIT_ID_KINDLE = ""
 HABIT_ID_STRAVA = ""
 HABIT_ID_WAKATIME = ""
 
