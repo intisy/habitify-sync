@@ -1,7 +1,7 @@
 import { readJson, STATE_KEYS, type SourceStatus } from "./state";
-import { SOURCES } from "./sources/registry";
+import { INTEGRATIONS } from "./integrations/registry";
 import { exchangeStravaCode } from "./sources/strava";
-import type { Env } from "./sources/types";
+import type { Env } from "./integrations/types";
 import { runSync } from "./sync";
 
 const STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize";
@@ -18,7 +18,7 @@ function isAuthorized(request: Request, env: Env, allowQueryToken: boolean): boo
 
 async function handleStatus(env: Env): Promise<Response> {
   const statuses: Record<string, SourceStatus | null> = {};
-  for (const source of SOURCES) {
+  for (const source of INTEGRATIONS) {
     statuses[source.name] = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
   }
   // Keys can outlive their source when an integration is removed from the registry; surface those too.
@@ -82,15 +82,15 @@ export async function handleFetch(request: Request, env: Env, fetchFn: typeof fe
   switch (route) {
     case "POST /sync": {
       const sourceParam = url.searchParams.get("source") ?? undefined;
-      if (sourceParam && !SOURCES.some((source) => source.name === sourceParam)) {
+      if (sourceParam && !INTEGRATIONS.some((source) => source.name === sourceParam)) {
         return Response.json(
           {
-            error: `unknown source "${sourceParam}"; valid sources: ${SOURCES.map((source) => source.name).join(", ")}`,
+            error: `unknown source "${sourceParam}"; valid sources: ${INTEGRATIONS.map((source) => source.name).join(", ")}`,
           },
           { status: 404 },
         );
       }
-      return Response.json(await runSync(env, SOURCES, new Date(), fetchFn, sourceParam));
+      return Response.json(await runSync(env, INTEGRATIONS, new Date(), fetchFn, sourceParam));
     }
     case "GET /status":
       return handleStatus(env);
@@ -110,7 +110,7 @@ export default {
     // Awaiting directly (instead of context.waitUntil) means a thrown error surfaces to
     // Cloudflare's cron failure reporting rather than being silently swallowed.
     try {
-      await runSync(env, SOURCES, new Date());
+      await runSync(env, INTEGRATIONS, new Date());
     } catch (error) {
       console.error("habitify-sync scheduled run failed:", error);
     }

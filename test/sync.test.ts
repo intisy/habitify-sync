@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { runSync } from "../src/sync";
 import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "../src/state";
-import { AuthNeededError, type Env, type Source } from "../src/sources/types";
+import { AuthNeededError, type Env, type Integration } from "../src/integrations/types";
 
 const now = new Date("2026-08-04T10:00:00Z");
 const testEnv: Env = { ...env, HABITIFY_API_KEY: "habitify-key" };
@@ -14,7 +14,7 @@ function habitifyFetchRecorder(urls: string[]): typeof fetch {
   }) as typeof fetch;
 }
 
-function makeSource(name: string, behavior: () => Promise<{ habitId: string; value: number; unit: string }[]>): Source {
+function makeSource(name: string, behavior: () => Promise<{ habitId: string; value: number; unit: string }[]>): Integration {
   return { name, enabled: () => true, fetchToday: behavior };
 }
 
@@ -72,7 +72,7 @@ describe("runSync", () => {
       state: "ok",
       lastSuccessAt: "2026-08-03T10:00:00.000Z",
     } satisfies SourceStatus);
-    const disabled: Source = {
+    const disabled: Integration = {
       name: "off",
       enabled: () => false,
       fetchToday: async () => {
