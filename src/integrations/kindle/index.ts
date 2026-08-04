@@ -94,7 +94,9 @@ interface BookReading {
 
 // Which tier produced a book's page contribution this sync, most exact first. Carried into
 // diagnostics so GET /status shows, per book, whether its figure is exact or estimated.
-type PageDerivation = "print-pages" | "words-per-page" | "positions-fallback";
+// "not-measured" is distinct from "positions-fallback": it means nothing was attempted at all
+// (no baseline yet, or the position hasn't advanced), not that wordCount was tried and failed.
+type PageDerivation = "print-pages" | "words-per-page" | "positions-fallback" | "not-measured";
 
 // Diagnostic, per-book progress — carried on the returned HabitValue's `diagnostics` field purely
 // so GET /status is useful for a human to sanity-check; not used in any math here, and never sent
@@ -494,18 +496,20 @@ export const kindleIntegration: Integration = {
 
       let pages = 0;
       let wordsRead = 0;
-      let derivation: PageDerivation = "positions-fallback";
+      let derivation: PageDerivation = "not-measured";
 
       if (baselinePosition === undefined) {
         // First time seen this local day: record the baseline now so the NEXT sync measures
         // progress from here, rather than from 0 forever. Contributes 0 to this sync's total; no
-        // derivation was attempted, so it can't be claimed exact.
+        // derivation was attempted (not even a failed one), so "not-measured" rather than
+        // "positions-fallback" — and it must not poison the top-level estimated flag, which is
+        // about whether the books that actually contributed pages were exact.
         mergedBaseline[asin] = position;
-        anyEstimated = true;
       } else if (position - baselinePosition <= 0) {
         // Never negative — a book re-read from an earlier position doesn't subtract from the
-        // day's total — and not worth a wordCount call to prove what's already 0.
-        anyEstimated = true;
+        // day's total — and not worth a wordCount call to prove what's already 0. Same reasoning
+        // as above: nothing was attempted, so this can't be "positions-fallback" and must not
+        // affect the estimated flag.
       } else {
         try {
           const result = await derivePagesSinceBaseline(
@@ -526,8 +530,10 @@ export const kindleIntegration: Integration = {
           derivation = result.derivation;
         } catch {
           // Defense in depth: derivePagesSinceBaseline's own steps already degrade internally on
-          // failure, but an unexpected throw still must not fail the whole sync.
+          // failure, but an unexpected throw still must not fail the whole sync. This book WAS
+          // attempted (delta > 0), so it's "positions-fallback", not "not-measured".
           pages = Math.max(0, (position - baselinePosition) / positionsPerPage);
+          derivation = "positions-fallback";
         }
         total += pages;
         if (derivation !== "print-pages") anyEstimated = true;

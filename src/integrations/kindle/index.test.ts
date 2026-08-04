@@ -15,7 +15,7 @@ interface KindleDiagnostics {
     title: string;
     progress: number;
     wordsRead: number;
-    derivation: "print-pages" | "words-per-page" | "positions-fallback";
+    derivation: "print-pages" | "words-per-page" | "positions-fallback" | "not-measured";
     pages: number;
   }[];
 }
@@ -356,9 +356,10 @@ describe("kindleIntegration.fetchToday - page delta math and baseline lifecycle"
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
     expect(values).toEqual([expect.objectContaining({ habitId: "habit-k", value: 0, unit: "pages" })]);
     const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    // No pageNumberUrl on either book, so the sync truthfully reports estimated even though the
-    // total itself is 0 (a fresh baseline never invents progress).
-    expect(stored).toEqual({ date: "2026-08-04", positions: { ASIN1: 1000, ASIN2: 2000 }, estimated: true });
+    // Neither book contributed any pages (both are first sightings), so nothing was estimated —
+    // "not-measured" is not "positions-fallback", and a book that was never measured must not
+    // poison the estimated flag (see the "non-contributing books" describe block below).
+    expect(stored).toEqual({ date: "2026-08-04", positions: { ASIN1: 1000, ASIN2: 2000 }, estimated: false });
   });
 
   it("yields the position delta divided by POSITIONS_PER_PAGE on a later sync using the default var", async () => {
@@ -719,6 +720,103 @@ describe("kindleIntegration.fetchToday - print-pages derivation", () => {
     // Sync 3: a new contentVersion (Amazon reflowed the book) must invalidate the cache.
     await kindleIntegration.fetchToday(makeContext(kindleEnv(pageCountsEnv), makeFetch(200000, "different-revision")));
     expect(wholeBookCallCount).toBe(2);
+  });
+});
+
+describe("kindleIntegration.fetchToday - non-contributing books are 'not-measured', never poisoning estimated", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+  });
+
+  it("labels every book 'not-measured' on the first sync of a day, with estimated false and no wordCount calls", async () => {
+    const asins = ["ASIN_A", "ASIN_B"];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(asins);
+      if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        return Response.json({
+          lastPageReadData: { position: 1000 },
+          metadataUrl: `https://cdn.example.com/metadata/${asin}`,
+        });
+      }
+      const metadataMatch = url.match(/metadata\/(.+)$/);
+      if (metadataMatch) return new Response(jsonp({ startPosition: 0, endPosition: 100000 }));
+      if (url.startsWith(WORD_COUNT_URL)) {
+        throw new Error("wordCount must not be called for a book on its first sighting today");
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ value: 0 })]);
+    const diagnostics = diagnosticsOf(values[0]);
+    expect(diagnostics?.estimated).toBe(false);
+    expect(diagnostics?.books).toHaveLength(2);
+    for (const book of diagnostics?.books ?? []) {
+      expect(book.derivation).toBe("not-measured");
+      expect(book.wordsRead).toBe(0);
+      expect(book.pages).toBe(0);
+    }
+  });
+
+  it("a stalled book reports 'not-measured' without making estimated true when another book used print-pages", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.baseline, STALLED: 5000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const advancingMetadataUrl = `https://cdn.example.com/metadata/${WORDCOUNT_BOOK.asin}`;
+    const stalledMetadataUrl = "https://cdn.example.com/metadata/STALLED";
+
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse([WORDCOUNT_BOOK.asin, "STALLED"]);
+      if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        if (asin === "STALLED") {
+          // Position unchanged from its stored baseline (5000): contributes nothing.
+          return Response.json({ lastPageReadData: { position: 5000 }, metadataUrl: stalledMetadataUrl });
+        }
+        return Response.json({
+          lastPageReadData: { position: WORDCOUNT_BOOK.position },
+          contentVersion: WORDCOUNT_BOOK.contentVersion,
+          karamelToken: DUMMY_RENDERING_TOKEN,
+          metadataUrl: advancingMetadataUrl,
+        });
+      }
+      if (url === stalledMetadataUrl || url === advancingMetadataUrl) {
+        return new Response(jsonp({ startPosition: 0, endPosition: 1000000 }));
+      }
+      if (url.startsWith(WORD_COUNT_URL)) {
+        // STALLED must never reach here at all — only the advancing book's asin is expected.
+        const parsed = new URL(url);
+        expect(parsed.searchParams.get("asin")).toBe(WORDCOUNT_BOOK.asin);
+        const start = parsed.searchParams.get("startPosition");
+        const end = parsed.searchParams.get("endPosition");
+        if (start === "0" && end === String(WORDCOUNT_BOOK.position)) return Response.json({ wordCount: WORDS_IN_RANGE });
+        if (start === "0" && end === null) return Response.json({ wordCount: WORDS_IN_WHOLE_BOOK });
+        throw new Error(`unexpected wordCount range ${start}-${end}`);
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_PAGE_COUNTS: `{"${WORDCOUNT_BOOK.asin}":272}` }), fetchFn),
+    );
+    const diagnostics = diagnosticsOf(values[0]);
+    // The stalled book's non-measurement must not force estimated true when the only contributing
+    // book used the exact print-pages tier.
+    expect(diagnostics?.estimated).toBe(false);
+    const advancing = diagnostics?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    const stalled = diagnostics?.books.find((entry) => entry.asin === "STALLED");
+    expect(advancing?.derivation).toBe("print-pages");
+    expect(stalled?.derivation).toBe("not-measured");
+    expect(stalled?.wordsRead).toBe(0);
+    expect(stalled?.pages).toBe(0);
   });
 });
 
