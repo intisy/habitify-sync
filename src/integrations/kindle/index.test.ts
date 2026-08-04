@@ -10,7 +10,14 @@ import { KINDLE_STATE_KEYS, kindleIntegration, type KindlePositions, type Kindle
 // is intentionally a loosely-typed bag), not the whole-object cast this used to require.
 interface KindleDiagnostics {
   estimated: boolean;
-  books: { asin: string; title: string; progress: number }[];
+  books: {
+    asin: string;
+    title: string;
+    progress: number;
+    wordsRead: number;
+    derivation: "print-pages" | "words-per-page" | "positions-fallback" | "not-measured";
+    pages: number;
+  }[];
 }
 
 function diagnosticsOf(value: HabitValue): KindleDiagnostics | undefined {
@@ -20,6 +27,14 @@ function diagnosticsOf(value: HabitValue): KindleDiagnostics | undefined {
 const DEVICE_TOKEN_URL = "https://read.amazon.com/service/web/register/getDeviceToken";
 const LIBRARY_URL = "https://read.amazon.com/kindle-library/search";
 const START_READING_URL = "https://read.amazon.com/service/mobile/reader/startReading";
+const WORD_COUNT_URL = "https://read.amazon.com/renderer/wordCount";
+
+// Real, verified measurements for asin B009ZUZ9FW, contentVersion e2e02ac4 (see the design doc):
+// wordCount(0, 238526) = 43090, wordCount(0) [whole book, no endPosition] = 98651.
+const WORDCOUNT_BOOK = { asin: "B009ZUZ9FW", contentVersion: "e2e02ac4", baseline: 0, position: 238526 };
+const WORDS_IN_RANGE = 43090;
+const WORDS_IN_WHOLE_BOOK = 98651;
+const DUMMY_RENDERING_TOKEN = "dummy-rendering-token";
 
 // A fake but well-formed Amazon cookie header — never a real value. session-id is the piece the
 // integration promotes to the x-amzn-sessionid header.
@@ -341,9 +356,10 @@ describe("kindleIntegration.fetchToday - page delta math and baseline lifecycle"
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
     expect(values).toEqual([expect.objectContaining({ habitId: "habit-k", value: 0, unit: "pages" })]);
     const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    // No pageNumberUrl on either book, so the sync truthfully reports estimated even though the
-    // total itself is 0 (a fresh baseline never invents progress).
-    expect(stored).toEqual({ date: "2026-08-04", positions: { ASIN1: 1000, ASIN2: 2000 }, estimated: true });
+    // Neither book contributed any pages (both are first sightings), so nothing was estimated —
+    // "not-measured" is not "positions-fallback", and a book that was never measured must not
+    // poison the estimated flag (see the "non-contributing books" describe block below).
+    expect(stored).toEqual({ date: "2026-08-04", positions: { ASIN1: 1000, ASIN2: 2000 }, estimated: false });
   });
 
   it("yields the position delta divided by POSITIONS_PER_PAGE on a later sync using the default var", async () => {
@@ -465,66 +481,462 @@ describe("kindleIntegration.fetchToday - page delta math and baseline lifecycle"
   });
 });
 
-describe("kindleIntegration.fetchToday - pageNumberUrl preferred when usable", () => {
+// Builds a fetchFn for a single word-count-eligible book: startReading returns contentVersion +
+// karamelToken (in whichever shape `karamelToken` is given), and wordCount responses are driven
+// off actual startPosition/endPosition query params rather than call order, matching how Amazon's
+// range semantics actually work (see the comment on fetchWordCount).
+function fetchForWordCountBook(options: {
+  asin: string;
+  contentVersion: string;
+  position: number;
+  karamelToken: unknown;
+  wordCountByRange: Record<string, number | "error">;
+  onWordCountCall?: (url: URL, headers: Headers) => void;
+}) {
+  const { asin, contentVersion, position, karamelToken, wordCountByRange, onWordCountCall } = options;
+  const metadataUrl = `https://cdn.example.com/metadata/${asin}`;
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+    if (url.startsWith(LIBRARY_URL)) return libraryResponse([asin]);
+    if (url.startsWith(START_READING_URL)) {
+      return Response.json({ lastPageReadData: { position }, contentVersion, karamelToken, metadataUrl });
+    }
+    // Arbitrary but valid span, purely so a progress fraction exists and the book gets a
+    // diagnostics entry — the pages math under test never reads this endpoint.
+    if (url === metadataUrl) {
+      return new Response(jsonp({ startPosition: 0, endPosition: 1000000 }));
+    }
+    if (url.startsWith(WORD_COUNT_URL)) {
+      const parsed = new URL(url);
+      onWordCountCall?.(parsed, new Headers(init?.headers));
+      const start = parsed.searchParams.get("startPosition");
+      const end = parsed.searchParams.get("endPosition");
+      const rangeKey = `${start}-${end ?? ""}`;
+      const result = wordCountByRange[rangeKey];
+      if (result === "error") return new Response("server error", { status: 500 });
+      if (result === undefined) throw new Error(`unexpected wordCount range ${rangeKey}`);
+      return Response.json({ wordCount: result });
+    }
+    throw new Error(`unexpected fetch to ${url}`);
+  }) as typeof fetch;
+}
+
+describe("kindleIntegration.fetchToday - wordCount request shape", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.baseline },
+      estimated: false,
+    } satisfies KindlePositions);
+  });
+
+  it("calls wordCount with the correct URL params and both the sessionid and rendering-token headers", async () => {
+    let seenUrl: URL | undefined;
+    let seenHeaders: Headers | undefined;
+    const fetchFn = fetchForWordCountBook({
+      asin: WORDCOUNT_BOOK.asin,
+      contentVersion: WORDCOUNT_BOOK.contentVersion,
+      position: WORDCOUNT_BOOK.position,
+      karamelToken: DUMMY_RENDERING_TOKEN,
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+      onWordCountCall: (url, headers) => {
+        seenUrl = url;
+        seenHeaders = headers;
+      },
+    });
+
+    await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+
+    expect(seenUrl?.searchParams.get("asin")).toBe(WORDCOUNT_BOOK.asin);
+    expect(seenUrl?.searchParams.get("revision")).toBe(WORDCOUNT_BOOK.contentVersion);
+    expect(seenUrl?.searchParams.get("contentType")).toBe("FullBook");
+    expect(seenUrl?.searchParams.get("startPosition")).toBe(String(WORDCOUNT_BOOK.baseline));
+    expect(seenUrl?.searchParams.get("endPosition")).toBe(String(WORDCOUNT_BOOK.position));
+    expect(seenHeaders?.get("x-amzn-sessionid")).toBe(DUMMY_SESSION_ID);
+    expect(seenHeaders?.get("x-amz-rendering-token")).toBe(DUMMY_RENDERING_TOKEN);
+  });
+
+  it("accepts karamelToken as a bare string", async () => {
+    const fetchFn = fetchForWordCountBook({
+      asin: WORDCOUNT_BOOK.asin,
+      contentVersion: WORDCOUNT_BOOK.contentVersion,
+      position: WORDCOUNT_BOOK.position,
+      karamelToken: DUMMY_RENDERING_TOKEN,
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+    });
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    const book = diagnosticsOf(values[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book?.wordsRead).toBe(WORDS_IN_RANGE);
+    expect(book?.derivation).toBe("words-per-page");
+  });
+
+  it("accepts karamelToken as an object with a .token field", async () => {
+    const fetchFn = fetchForWordCountBook({
+      asin: WORDCOUNT_BOOK.asin,
+      contentVersion: WORDCOUNT_BOOK.contentVersion,
+      position: WORDCOUNT_BOOK.position,
+      karamelToken: { token: DUMMY_RENDERING_TOKEN },
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+    });
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    const book = diagnosticsOf(values[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book?.wordsRead).toBe(WORDS_IN_RANGE);
+    expect(book?.derivation).toBe("words-per-page");
+  });
+});
+
+describe("kindleIntegration.fetchToday - words-per-page derivation", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.baseline },
+      estimated: false,
+    } satisfies KindlePositions);
+  });
+
+  it("derives pages from words read at the default 250 words/page when no print length is configured", async () => {
+    const fetchFn = fetchForWordCountBook({
+      asin: WORDCOUNT_BOOK.asin,
+      contentVersion: WORDCOUNT_BOOK.contentVersion,
+      position: WORDCOUNT_BOOK.position,
+      karamelToken: DUMMY_RENDERING_TOKEN,
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+    });
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    // 43090 / 250 = 172.36 -> rounds to 172.
+    expect(values).toEqual([expect.objectContaining({ value: 172 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
+  });
+
+  it("honors an overridden KINDLE_WORDS_PER_PAGE", async () => {
+    const fetchFn = fetchForWordCountBook({
+      asin: WORDCOUNT_BOOK.asin,
+      contentVersion: WORDCOUNT_BOOK.contentVersion,
+      position: WORDCOUNT_BOOK.position,
+      karamelToken: DUMMY_RENDERING_TOKEN,
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+    });
+
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_WORDS_PER_PAGE: "200" }), fetchFn),
+    );
+    // 43090 / 200 = 215.45 -> rounds to 215.
+    expect(values).toEqual([expect.objectContaining({ value: 215 })]);
+  });
+});
+
+describe("kindleIntegration.fetchToday - print-pages derivation", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.baseline },
+      estimated: false,
+    } satisfies KindlePositions);
+  });
+
+  it("derives pages exactly from the configured print length and the real word counts", async () => {
+    const fetchFn = fetchForWordCountBook({
+      asin: WORDCOUNT_BOOK.asin,
+      contentVersion: WORDCOUNT_BOOK.contentVersion,
+      position: WORDCOUNT_BOOK.position,
+      karamelToken: DUMMY_RENDERING_TOKEN,
+      wordCountByRange: {
+        [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE,
+        "0-": WORDS_IN_WHOLE_BOOK,
+      },
+    });
+
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_PAGE_COUNTS: `{"${WORDCOUNT_BOOK.asin}":272}` }), fetchFn),
+    );
+    // (43090/98651)*272 ≈ 118.8 -> rounds to 119.
+    expect(values).toEqual([expect.objectContaining({ value: 119 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(false);
+    const book = diagnosticsOf(values[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book?.derivation).toBe("print-pages");
+    expect(book?.pages).toBeCloseTo(118.8, 1);
+  });
+
+  it.each([
+    ["invalid JSON", "not json"],
+    ["a JSON array", `[{"${WORDCOUNT_BOOK.asin}":272}]`],
+    ["a zero page count", `{"${WORDCOUNT_BOOK.asin}":0}`],
+    ["a negative page count", `{"${WORDCOUNT_BOOK.asin}":-5}`],
+    ["a string page count", `{"${WORDCOUNT_BOOK.asin}":"272"}`],
+  ])("falls through to words-per-page without throwing when KINDLE_PAGE_COUNTS is %s", async (_label, raw) => {
+    const fetchFn = fetchForWordCountBook({
+      asin: WORDCOUNT_BOOK.asin,
+      contentVersion: WORDCOUNT_BOOK.contentVersion,
+      position: WORDCOUNT_BOOK.position,
+      karamelToken: DUMMY_RENDERING_TOKEN,
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+    });
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv({ KINDLE_PAGE_COUNTS: raw }), fetchFn));
+    // Falls all the way through to the words-per-page default: 43090/250 = 172.36 -> 172.
+    expect(values).toEqual([expect.objectContaining({ value: 172 })]);
+    expect(diagnosticsOf(values[0])?.books[0]?.derivation).toBe("words-per-page");
+  });
+
+  it("fetches totalWordsInBook once and caches it in KV, keyed to contentVersion", async () => {
+    let wholeBookCallCount = 0;
+    const makeFetch = (position: number, contentVersion: string) =>
+      fetchForWordCountBook({
+        asin: WORDCOUNT_BOOK.asin,
+        contentVersion,
+        position,
+        karamelToken: DUMMY_RENDERING_TOKEN,
+        wordCountByRange: {
+          [`${WORDCOUNT_BOOK.baseline}-${position}`]: 1000,
+          "0-": WORDS_IN_WHOLE_BOOK,
+        },
+        onWordCountCall: (url) => {
+          if (url.searchParams.get("startPosition") === "0" && !url.searchParams.has("endPosition")) {
+            wholeBookCallCount++;
+          }
+        },
+      });
+    const pageCountsEnv = { KINDLE_PAGE_COUNTS: `{"${WORDCOUNT_BOOK.asin}":272}` };
+
+    // Sync 1: contentVersion e2e02ac4, position advances from baseline 0 to 100000.
+    await kindleIntegration.fetchToday(
+      makeContext(kindleEnv(pageCountsEnv), makeFetch(100000, WORDCOUNT_BOOK.contentVersion)),
+    );
+    expect(wholeBookCallCount).toBe(1);
+
+    // Sync 2: same contentVersion, position advances further — total words must come from cache.
+    await kindleIntegration.fetchToday(
+      makeContext(kindleEnv(pageCountsEnv), makeFetch(150000, WORDCOUNT_BOOK.contentVersion)),
+    );
+    expect(wholeBookCallCount).toBe(1);
+
+    // Sync 3: a new contentVersion (Amazon reflowed the book) must invalidate the cache.
+    await kindleIntegration.fetchToday(makeContext(kindleEnv(pageCountsEnv), makeFetch(200000, "different-revision")));
+    expect(wholeBookCallCount).toBe(2);
+  });
+});
+
+describe("kindleIntegration.fetchToday - non-contributing books are 'not-measured', never poisoning estimated", () => {
   beforeEach(async () => {
     await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
   });
 
-  it("uses the real page map for the delta instead of the position estimate when it parses", async () => {
-    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
-      date: "2026-08-04",
-      positions: { ASIN1: 1000 },
-      estimated: false,
-    } satisfies KindlePositions);
-
+  it("labels every book 'not-measured' on the first sync of a day, with estimated false and no wordCount calls", async () => {
+    const asins = ["ASIN_A", "ASIN_B"];
     const fetchFn = (async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
-      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(asins);
       if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
         return Response.json({
-          lastPageReadData: { position: 4600 },
-          pageNumberUrl: "https://cdn.example.com/pagemap/asin1",
+          lastPageReadData: { position: 1000 },
+          metadataUrl: `https://cdn.example.com/metadata/${asin}`,
         });
       }
-      if (url === "https://cdn.example.com/pagemap/asin1") {
-        // map[i] is the starting position of page i; 1000 -> page 1, 4600 -> page 4
-        return Response.json([0, 1000, 2200, 3400, 4600, 5800]);
+      const metadataMatch = url.match(/metadata\/(.+)$/);
+      if (metadataMatch) return new Response(jsonp({ startPosition: 0, endPosition: 100000 }));
+      if (url.startsWith(WORD_COUNT_URL)) {
+        throw new Error("wordCount must not be called for a book on its first sighting today");
       }
       throw new Error(`unexpected fetch to ${url}`);
     }) as typeof fetch;
 
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    // page(4600) - page(1000) = 4 - 1 = 3, and this path is not an estimate.
-    expect(values).toEqual([expect.objectContaining({ value: 3 })]);
-    expect(diagnosticsOf(values[0])?.estimated).toBe(false);
+    expect(values).toEqual([expect.objectContaining({ value: 0 })]);
+    const diagnostics = diagnosticsOf(values[0]);
+    expect(diagnostics?.estimated).toBe(false);
+    expect(diagnostics?.books).toHaveLength(2);
+    for (const book of diagnostics?.books ?? []) {
+      expect(book.derivation).toBe("not-measured");
+      expect(book.wordsRead).toBe(0);
+      expect(book.pages).toBe(0);
+    }
   });
 
-  it("falls back to the position estimate when the pageNumberUrl map is unparseable", async () => {
+  it("a stalled book reports 'not-measured' without making estimated true when another book used print-pages", async () => {
     await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
       date: "2026-08-04",
-      positions: { ASIN1: 1000 },
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.baseline, STALLED: 5000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const advancingMetadataUrl = `https://cdn.example.com/metadata/${WORDCOUNT_BOOK.asin}`;
+    const stalledMetadataUrl = "https://cdn.example.com/metadata/STALLED";
+
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse([WORDCOUNT_BOOK.asin, "STALLED"]);
+      if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        if (asin === "STALLED") {
+          // Position unchanged from its stored baseline (5000): contributes nothing.
+          return Response.json({ lastPageReadData: { position: 5000 }, metadataUrl: stalledMetadataUrl });
+        }
+        return Response.json({
+          lastPageReadData: { position: WORDCOUNT_BOOK.position },
+          contentVersion: WORDCOUNT_BOOK.contentVersion,
+          karamelToken: DUMMY_RENDERING_TOKEN,
+          metadataUrl: advancingMetadataUrl,
+        });
+      }
+      if (url === stalledMetadataUrl || url === advancingMetadataUrl) {
+        return new Response(jsonp({ startPosition: 0, endPosition: 1000000 }));
+      }
+      if (url.startsWith(WORD_COUNT_URL)) {
+        // STALLED must never reach here at all — only the advancing book's asin is expected.
+        const parsed = new URL(url);
+        expect(parsed.searchParams.get("asin")).toBe(WORDCOUNT_BOOK.asin);
+        const start = parsed.searchParams.get("startPosition");
+        const end = parsed.searchParams.get("endPosition");
+        if (start === "0" && end === String(WORDCOUNT_BOOK.position)) return Response.json({ wordCount: WORDS_IN_RANGE });
+        if (start === "0" && end === null) return Response.json({ wordCount: WORDS_IN_WHOLE_BOOK });
+        throw new Error(`unexpected wordCount range ${start}-${end}`);
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_PAGE_COUNTS: `{"${WORDCOUNT_BOOK.asin}":272}` }), fetchFn),
+    );
+    const diagnostics = diagnosticsOf(values[0]);
+    // The stalled book's non-measurement must not force estimated true when the only contributing
+    // book used the exact print-pages tier.
+    expect(diagnostics?.estimated).toBe(false);
+    const advancing = diagnostics?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    const stalled = diagnostics?.books.find((entry) => entry.asin === "STALLED");
+    expect(advancing?.derivation).toBe("print-pages");
+    expect(stalled?.derivation).toBe("not-measured");
+    expect(stalled?.wordsRead).toBe(0);
+    expect(stalled?.pages).toBe(0);
+  });
+});
+
+describe("kindleIntegration.fetchToday - wordCount failure and efficiency", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+  });
+
+  it("falls back to the positions path for a book whose wordCount call fails, without affecting another book", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { BROKEN: 1000, GOOD: 0 },
       estimated: false,
     } satisfies KindlePositions);
 
     const fetchFn = (async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
-      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["BROKEN", "GOOD"]);
       if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        if (asin === "BROKEN") {
+          // delta 2800 (1000 -> 3800), contentVersion present but wordCount itself will fail.
+          return Response.json({
+            lastPageReadData: { position: 3800 },
+            contentVersion: "rev-broken",
+            karamelToken: DUMMY_RENDERING_TOKEN,
+            metadataUrl: "https://cdn.example.com/metadata/BROKEN",
+          });
+        }
+        // delta 43090 words worth of positions (0 -> 238526), succeeds via words-per-page.
         return Response.json({
-          lastPageReadData: { position: 4600 },
-          pageNumberUrl: "https://cdn.example.com/pagemap/bad",
+          lastPageReadData: { position: WORDCOUNT_BOOK.position },
+          contentVersion: WORDCOUNT_BOOK.contentVersion,
+          karamelToken: DUMMY_RENDERING_TOKEN,
+          metadataUrl: "https://cdn.example.com/metadata/GOOD",
         });
       }
-      if (url === "https://cdn.example.com/pagemap/bad") return Response.json({ unexpectedShape: true });
+      // Arbitrary but valid span, purely so a progress fraction exists and each book gets a
+      // diagnostics entry — the pages math under test never reads this endpoint.
+      if (url === "https://cdn.example.com/metadata/BROKEN" || url === "https://cdn.example.com/metadata/GOOD") {
+        return new Response(jsonp({ startPosition: 0, endPosition: 1000000 }));
+      }
+      if (url.startsWith(WORD_COUNT_URL)) {
+        const parsed = new URL(url);
+        const revision = parsed.searchParams.get("revision");
+        if (revision === "rev-broken") return new Response("server error", { status: 500 });
+        if (revision === WORDCOUNT_BOOK.contentVersion) return Response.json({ wordCount: WORDS_IN_RANGE });
+        throw new Error(`unexpected wordCount revision ${revision}`);
+      }
       throw new Error(`unexpected fetch to ${url}`);
     }) as typeof fetch;
 
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    // (4600-1000)/1800 = 2, estimated.
-    expect(values).toEqual([expect.objectContaining({ value: 2 })]);
-    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
+    const books = diagnosticsOf(values[0])?.books ?? [];
+    const broken = books.find((entry) => entry.asin === "BROKEN");
+    const good = books.find((entry) => entry.asin === "GOOD");
+    // BROKEN falls back to (3800-1000)/1800 = 1.555...; GOOD uses 43090/250 = 172.36.
+    // Summed before rounding: 1.555... + 172.36 = 173.9155... -> rounds to 174.
+    expect(broken?.derivation).toBe("positions-fallback");
+    expect(good?.derivation).toBe("words-per-page");
+    expect(values).toEqual([expect.objectContaining({ value: 174 })]);
+  });
+
+  it("makes no wordCount call at all for a book whose position did not advance past its baseline", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.position },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse([WORDCOUNT_BOOK.asin]);
+      if (url.startsWith(START_READING_URL)) {
+        // Position unchanged from the stored baseline: delta is 0.
+        return Response.json({
+          lastPageReadData: { position: WORDCOUNT_BOOK.position },
+          contentVersion: WORDCOUNT_BOOK.contentVersion,
+          karamelToken: DUMMY_RENDERING_TOKEN,
+        });
+      }
+      if (url.startsWith(WORD_COUNT_URL)) {
+        throw new Error("wordCount must not be called for a book that has not advanced past its baseline");
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ value: 0 })]);
+  });
+
+  it("sums multiple books' fractional word-count-derived pages before the single final rounding", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { BOOK_A: 0, BOOK_B: 0 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    // Each book reads 125 words at the default 250 words/page => exactly 0.5 pages each. Rounding
+    // each independently (0.5 -> 1) would wrongly total 2; summing first and rounding once yields 1.
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["BOOK_A", "BOOK_B"]);
+      if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        return Response.json({
+          lastPageReadData: { position: 500 },
+          contentVersion: `rev-${asin}`,
+          karamelToken: DUMMY_RENDERING_TOKEN,
+        });
+      }
+      if (url.startsWith(WORD_COUNT_URL)) return Response.json({ wordCount: 125 });
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ value: 1 })]);
   });
 });
 
