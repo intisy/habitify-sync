@@ -10,6 +10,8 @@ export interface SourceStatus {
   lastErrorAt?: string;
   lastError?: string;
   values?: HabitValue[];
+  /** Human-readable notes recorded whenever a value's Habitify unit wasn't the habit's own configured unit. */
+  unitFallbacks?: string[];
 }
 
 export async function readJson<T>(kv: KVNamespace, key: string): Promise<T | null> {
