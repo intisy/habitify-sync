@@ -205,6 +205,95 @@ describe("HabitifyClient.listHabits", () => {
   });
 });
 
+describe("HabitifyClient.listHabitsRaw", () => {
+  it("sends the correct /v2/habits URL and the X-API-Key header, not Authorization", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    await client.listHabitsRaw();
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].method).toBe("GET");
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits");
+    expect(recorded[0].apiKey).toBe("api-key");
+    expect(recorded[0].authorization).toBeNull();
+  });
+
+  it("returns the response body verbatim, including fields the trimmed parser drops", async () => {
+    const rawBody = {
+      data: [
+        {
+          id: "habit-1",
+          name: "Read",
+          icon: "book",
+          colorHex: "#ffffff",
+          type: "good",
+          description: "Read every day",
+          occurrence: { type: "daily" },
+          area: "personal",
+          timeOfDay: "anytime",
+          archived: false,
+          startDate: "2026-01-01T00:00:00Z",
+          createdAt: "2026-01-01T00:00:00Z",
+          goals: [{ id: "goal-1", periodicity: "daily", value: 1, unit: "rep" }],
+        },
+      ],
+    };
+    const client = new HabitifyClient("api-key", jsonFetch(rawBody), "https://habitify.example/v2");
+    const result = await client.listHabitsRaw();
+    expect(result).toEqual(rawBody);
+  });
+
+  it("throws on a non-ok response", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example/v2");
+    await expect(client.listHabitsRaw()).rejects.toThrow("Habitify GET /habits failed with status 401");
+  });
+});
+
+describe("HabitifyClient.getJournalRaw", () => {
+  it("requests /v2/habits/journal with no query string when no date is given", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    await client.getJournalRaw();
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].method).toBe("GET");
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits/journal");
+    expect(recorded[0].apiKey).toBe("api-key");
+    expect(recorded[0].authorization).toBeNull();
+  });
+
+  it("appends ?date=<date> when a date is given", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    await client.getJournalRaw("2026-08-05");
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits/journal?date=2026-08-05");
+  });
+
+  it("rejects a malformed date before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    await expect(client.getJournalRaw("not-a-date")).rejects.toThrow(HabitInputValidationError);
+    await expect(client.getJournalRaw("not-a-date")).rejects.toThrow(/YYYY-MM-DD/);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("returns the response body verbatim", async () => {
+    const rawBody = {
+      data: [{ id: "habit-1", name: "Read", status: "completed", progress: { current: 1, target: 1 } }],
+    };
+    const client = new HabitifyClient("api-key", jsonFetch(rawBody), "https://habitify.example/v2");
+    const result = await client.getJournalRaw("2026-08-05");
+    expect(result).toEqual(rawBody);
+  });
+
+  it("throws on a non-ok response", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example/v2");
+    await expect(client.getJournalRaw()).rejects.toThrow("Habitify GET /habits/journal failed with status 401");
+  });
+});
+
 describe("HabitifyClient.createHabit", () => {
   function createdHabitFetch(status = 201): typeof fetch {
     return (async () =>
@@ -472,6 +561,22 @@ describe("HabitifyClient fetchFn this-binding", () => {
     const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ id: "habit-new", name: "Read", goals: [] });
     const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
     await client.createHabit({ name: "Read" });
+    expect(getRecordedThis()).toBeUndefined();
+    expect(getRecordedThis()).not.toBe(client);
+  });
+
+  it("invokes fetchFn with this === undefined in listHabitsRaw, not the HabitifyClient instance", async () => {
+    const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ data: [] });
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    await client.listHabitsRaw();
+    expect(getRecordedThis()).toBeUndefined();
+    expect(getRecordedThis()).not.toBe(client);
+  });
+
+  it("invokes fetchFn with this === undefined in getJournalRaw, not the HabitifyClient instance", async () => {
+    const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ data: [] });
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    await client.getJournalRaw();
     expect(getRecordedThis()).toBeUndefined();
     expect(getRecordedThis()).not.toBe(client);
   });

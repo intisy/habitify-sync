@@ -110,6 +110,31 @@ describe("GET /habits", () => {
     expect(body.error).toContain("500");
     expect(JSON.stringify(body)).not.toContain("habitify-key");
   });
+
+  it("with ?raw=1, returns the untrimmed payload instead of the trimmed summaries", async () => {
+    const rawBody = {
+      data: [
+        {
+          id: "habit-1",
+          name: "Read",
+          goals: [{ id: "goal-1", createdAt: "2026-01-01T00:00:00Z", periodicity: "daily", value: 1, unit: "rep" }],
+          area: "personal",
+          timeOfDay: "anytime",
+          archived: false,
+          startDate: "2026-01-01T00:00:00Z",
+        },
+      ],
+    };
+    const fetchFn = (async () => Response.json(rawBody)) as typeof fetch;
+    const response = await handleFetch(
+      new Request("https://worker.example/habits?raw=1", { headers: bearer }),
+      authedEnv,
+      fetchFn,
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as unknown;
+    expect(body).toEqual(rawBody);
+  });
 });
 
 describe("POST /habits", () => {
@@ -239,6 +264,71 @@ describe("POST /habits", () => {
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain("probably created");
     expect(callCount).toBe(2);
+  });
+});
+
+describe("GET /journal", () => {
+  it("rejects requests without the admin token", async () => {
+    expect((await request("/journal")).status).toBe(401);
+  });
+
+  it("returns the journal payload using the injected fetchFn", async () => {
+    const journalBody = {
+      data: [{ id: "habit-1", name: "Read", status: "completed", progress: { current: 1, target: 1 } }],
+    };
+    const fetchFn = (async () => Response.json(journalBody)) as typeof fetch;
+    const response = await handleFetch(new Request("https://worker.example/journal", { headers: bearer }), authedEnv, fetchFn);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as unknown;
+    expect(body).toEqual(journalBody);
+  });
+
+  it("appends the date to the upstream request when ?date= is given", async () => {
+    let requestedUrl = "";
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      requestedUrl = String(input);
+      return Response.json({ data: [] });
+    }) as typeof fetch;
+    const response = await handleFetch(
+      new Request("https://worker.example/journal?date=2026-08-05", { headers: bearer }),
+      authedEnv,
+      fetchFn,
+    );
+    expect(response.status).toBe(200);
+    expect(requestedUrl).toBe("https://api.habitify.me/v2/habits/journal?date=2026-08-05");
+  });
+
+  it("returns 400 when ?date= is malformed", async () => {
+    const response = await handleFetch(
+      new Request("https://worker.example/journal?date=nonsense", { headers: bearer }),
+      authedEnv,
+      fetch,
+    );
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("YYYY-MM-DD");
+  });
+
+  it("returns 503 with a clear error when HABITIFY_API_KEY is unset", async () => {
+    const envWithoutKey: Env = { ...authedEnv, HABITIFY_API_KEY: "" };
+    const response = await handleFetch(
+      new Request("https://worker.example/journal", { headers: bearer }),
+      envWithoutKey,
+      fetch,
+    );
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("HABITIFY_API_KEY is not configured");
+    expect(JSON.stringify(body)).not.toContain("habitify-key");
+  });
+
+  it("returns 502 with the upstream status/message when the Habitify call fails", async () => {
+    const fetchFn = (async () => new Response("nope", { status: 500 })) as typeof fetch;
+    const response = await handleFetch(new Request("https://worker.example/journal", { headers: bearer }), authedEnv, fetchFn);
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("500");
+    expect(JSON.stringify(body)).not.toContain("habitify-key");
   });
 });
 
