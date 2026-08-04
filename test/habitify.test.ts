@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HabitifyClient } from "../src/habitify";
+import { HabitifyClient, HabitInputValidationError } from "../src/habitify";
 
 interface RecordedRequest {
   method: string;
@@ -25,6 +25,26 @@ function recordingFetch(recorded: RecordedRequest[], status = 200): typeof fetch
 
 function jsonFetch(body: unknown, status = 200): typeof fetch {
   return (async () => new Response(JSON.stringify(body), { status })) as typeof fetch;
+}
+
+// Like recordingFetch, but its success body is a usable created-habit object (an id, at
+// minimum) rather than "{}" — needed for createHabit tests, since createHabit parses its
+// response body and throws if it can't find an id.
+function recordingCreatedHabitFetch(recorded: RecordedRequest[], status = 201): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    recorded.push({
+      method: init?.method ?? "GET",
+      url: String(input),
+      body: init?.body === undefined ? undefined : String(init.body),
+      apiKey: headers.get("X-API-Key"),
+      authorization: headers.get("Authorization"),
+    });
+    return new Response(
+      status >= 200 && status < 300 ? JSON.stringify({ id: "habit-new", name: "Read", goals: [] }) : "error",
+      { status },
+    );
+  }) as typeof fetch;
 }
 
 describe("HabitifyClient.upsertTodayLog", () => {
@@ -185,6 +205,142 @@ describe("HabitifyClient.listHabits", () => {
   });
 });
 
+describe("HabitifyClient.createHabit", () => {
+  function createdHabitFetch(status = 201): typeof fetch {
+    return (async () =>
+      new Response(
+        JSON.stringify({
+          id: "habit-new",
+          name: "Read 10 pages",
+          goals: [{ id: "goal-1", periodicity: "daily", value: 10, unit: "rep" }],
+        }),
+        { status },
+      )) as typeof fetch;
+  }
+
+  it("sends the correct /v2/habits URL, the X-API-Key header (not Authorization), and defaults", async () => {
+    const recorded: RecordedRequest[] = [];
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      recorded.push({
+        method: init?.method ?? "GET",
+        url: String(input),
+        body: init?.body === undefined ? undefined : String(init.body),
+        apiKey: headers.get("X-API-Key"),
+        authorization: headers.get("Authorization"),
+      });
+      return new Response(JSON.stringify({ id: "habit-new", name: "Read", goals: [] }), { status: 201 });
+    }) as typeof fetch;
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    await client.createHabit({ name: "Read" });
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].method).toBe("POST");
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits");
+    expect(recorded[0].apiKey).toBe("api-key");
+    expect(recorded[0].authorization).toBeNull();
+    expect(JSON.parse(recorded[0].body!)).toEqual({
+      name: "Read",
+      type: "good",
+      occurrence: { type: "daily" },
+    });
+  });
+
+  it("omits optional fields entirely rather than sending them as null", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingCreatedHabitFetch(recorded), "https://habitify.example/v2");
+    await client.createHabit({ name: "Read" });
+    const body = JSON.parse(recorded[0].body!);
+    expect("description" in body).toBe(false);
+    expect("goal" in body).toBe(false);
+    expect("areaIds" in body).toBe(false);
+    expect("timeOfDayIds" in body).toBe(false);
+  });
+
+  it("passes goal through verbatim when given", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingCreatedHabitFetch(recorded), "https://habitify.example/v2");
+    await client.createHabit({
+      name: "Read",
+      type: "good",
+      description: "Read every day",
+      goal: { periodicity: "daily", value: 10, unit: "rep" },
+      occurrence: { type: "weekDays", days: [1, 2, 3, 4, 5] },
+    });
+    const body = JSON.parse(recorded[0].body!);
+    expect(body).toEqual({
+      name: "Read",
+      type: "good",
+      description: "Read every day",
+      goal: { periodicity: "daily", value: 10, unit: "rep" },
+      occurrence: { type: "weekDays", days: [1, 2, 3, 4, 5] },
+    });
+  });
+
+  it("parses the 201 body into { id, name, unit }, taking unit from the first goal", async () => {
+    const client = new HabitifyClient("api-key", createdHabitFetch(), "https://habitify.example/v2");
+    const created = await client.createHabit({ name: "Read 10 pages", goal: { periodicity: "daily", value: 10, unit: "rep" } });
+    expect(created).toEqual({ id: "habit-new", name: "Read 10 pages", unit: "rep" });
+  });
+
+  it("throws on a non-ok response", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 422), "https://habitify.example/v2");
+    await expect(client.createHabit({ name: "Read" })).rejects.toThrow("Habitify POST /habits failed with status 422");
+  });
+
+  it("rejects an empty name before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 201), "https://habitify.example/v2");
+    await expect(client.createHabit({ name: "   " })).rejects.toThrow(HabitInputValidationError);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("rejects an invalid type before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 201), "https://habitify.example/v2");
+    await expect(
+      client.createHabit({ name: "Read", type: "neutral" as unknown as "good" }),
+    ).rejects.toThrow(/Invalid habit type "neutral"/);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("rejects an invalid goal periodicity before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 201), "https://habitify.example/v2");
+    await expect(
+      client.createHabit({ name: "Read", goal: { periodicity: "hourly" as unknown as "daily", value: 1, unit: "rep" } }),
+    ).rejects.toThrow(/Invalid goal periodicity "hourly"/);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("rejects a non-positive goal value before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 201), "https://habitify.example/v2");
+    await expect(
+      client.createHabit({ name: "Read", goal: { periodicity: "daily", value: 0, unit: "rep" } }),
+    ).rejects.toThrow(/Invalid goal value 0/);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("rejects a non-finite goal value before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 201), "https://habitify.example/v2");
+    await expect(
+      client.createHabit({ name: "Read", goal: { periodicity: "daily", value: Infinity, unit: "rep" } }),
+    ).rejects.toThrow(/Invalid goal value Infinity/);
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("rejects an invalid goal unit before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 201), "https://habitify.example/v2");
+    await expect(
+      client.createHabit({ name: "Read", goal: { periodicity: "daily", value: 10, unit: "pages" } }),
+    ).rejects.toThrow(/Invalid Habitify unitSymbol "pages"/);
+    expect(recorded).toHaveLength(0);
+  });
+});
+
 // A plain vi.fn() mock is indifferent to its `this` binding, so it can't reproduce workerd's
 // behavior: calling the native fetch with a `this` that isn't the global scope throws "Illegal
 // invocation". These tests instead use a real, non-arrow `function` that records whatever `this`
@@ -216,6 +372,14 @@ describe("HabitifyClient fetchFn this-binding", () => {
     const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ data: [] });
     const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
     await client.listHabits();
+    expect(getRecordedThis()).toBeUndefined();
+    expect(getRecordedThis()).not.toBe(client);
+  });
+
+  it("invokes fetchFn with this === undefined in createHabit, not the HabitifyClient instance", async () => {
+    const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ id: "habit-new", name: "Read", goals: [] });
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    await client.createHabit({ name: "Read" });
     expect(getRecordedThis()).toBeUndefined();
     expect(getRecordedThis()).not.toBe(client);
   });
