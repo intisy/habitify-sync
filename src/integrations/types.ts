@@ -5,9 +5,11 @@ export interface Env {
   TIMEZONE?: string;
   HABIT_ID_STRAVA?: string;
   HABIT_ID_WAKATIME?: string;
+  HABIT_ID_KINDLE?: string;
   STRAVA_CLIENT_ID?: string;
   STRAVA_CLIENT_SECRET?: string;
   WAKATIME_API_KEY?: string;
+  KINDLE_POSITIONS_PER_PAGE?: string;
 }
 
 export interface HabitValue {

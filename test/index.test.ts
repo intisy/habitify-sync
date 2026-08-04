@@ -32,22 +32,23 @@ describe("authentication", () => {
 
 describe("POST /sync", () => {
   it("returns 404 naming the valid sources when ?source= matches none registered", async () => {
-    const response = await request("/sync?source=kindle", { method: "POST", headers: bearer });
+    const response = await request("/sync?source=nonexistent", { method: "POST", headers: bearer });
     expect(response.status).toBe(404);
     const body = (await response.json()) as { error: string };
-    expect(body.error).toContain("kindle");
+    expect(body.error).toContain("nonexistent");
     expect(body.error).toContain("strava");
     expect(body.error).toContain("wakatime");
+    expect(body.error).toContain("kindle");
   });
 });
 
 describe("GET /status", () => {
   it("returns stored status for a source no longer in the registry", async () => {
-    await writeJson(env.STATE, STATE_KEYS.sourceStatus("kindle"), { state: "ok" } satisfies SourceStatus);
+    await writeJson(env.STATE, STATE_KEYS.sourceStatus("retired-service"), { state: "ok" } satisfies SourceStatus);
     const response = await request("/status", { headers: bearer });
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, SourceStatus>;
-    expect(body.kindle.state).toBe("ok");
+    expect(body["retired-service"].state).toBe("ok");
   });
 
   it("includes a registered source that has never run as null", async () => {
