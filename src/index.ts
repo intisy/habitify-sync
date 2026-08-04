@@ -108,7 +108,13 @@ export default {
     return handleFetch(request, env);
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext): Promise<void> {
-    context.waitUntil(runSync(env, SOURCES, new Date()));
+  async scheduled(_controller: ScheduledController, env: Env, _context: ExecutionContext): Promise<void> {
+    // Awaiting directly (instead of context.waitUntil) means a thrown error surfaces to
+    // Cloudflare's cron failure reporting rather than being silently swallowed.
+    try {
+      await runSync(env, SOURCES, new Date());
+    } catch (error) {
+      console.error("habitify-sync scheduled run failed:", error);
+    }
   },
 } satisfies ExportedHandler<Env>;

@@ -5,6 +5,9 @@ compatibility_date = "2026-01-01"
 [triggers]
 crons = ["0 * * * *"]
 
+[observability]
+enabled = true
+
 [vars]
 TIMEZONE = "Europe/Berlin"
 HABIT_ID_KINDLE = ""

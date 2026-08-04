@@ -1,4 +1,4 @@
-import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker, { handleFetch } from "../src/index";
 import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus, type StravaTokens } from "../src/state";
@@ -114,5 +114,20 @@ describe("GET /strava/callback", () => {
     expect(response.status).toBe(200);
     const stored = await readJson<StravaTokens>(env.STATE, STATE_KEYS.stravaTokens);
     expect(stored).toEqual({ accessToken: "access-1", refreshToken: "refresh-1", expiresAt: 9999999999 });
+  });
+});
+
+describe("scheduled", () => {
+  it("runs the sync and writes source status to KV", async () => {
+    await env.STATE.delete(STATE_KEYS.sourceStatus("strava"));
+    await env.STATE.delete(STATE_KEYS.sourceStatus("wakatime"));
+
+    const controller = createScheduledController();
+    const context = createExecutionContext();
+    await worker.scheduled(controller, authedEnv, context);
+    await waitOnExecutionContext(context);
+
+    const stravaStatus = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus("strava"));
+    expect(stravaStatus).not.toBeNull();
   });
 });
