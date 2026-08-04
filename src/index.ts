@@ -48,17 +48,51 @@ async function handleSync(request: Request, context: RouteContext): Promise<Resp
 
 // Lets an operator discover Habitify habit ids without ever handling HABITIFY_API_KEY locally —
 // the worker already holds the secret, so it can look habits up on the operator's behalf.
-async function handleListHabits(context: RouteContext): Promise<Response> {
+// `?raw=1` switches to the untouched GET /habits payload instead of the trimmed
+// { id, name, unit } summaries — a diagnostic escape hatch for when the trimmed shape hides the
+// field that explains a habit's unexpected behavior (scheduling, area, time-of-day, archived
+// flag, created timestamp, etc.). The default (no `raw`) behavior is unchanged.
+async function handleListHabits(request: Request, context: RouteContext): Promise<Response> {
   if (!context.env.HABITIFY_API_KEY) {
     return Response.json({ error: "HABITIFY_API_KEY is not configured" }, { status: 503 });
   }
+  const url = new URL(request.url);
+  const raw = url.searchParams.has("raw");
   const habitify = new HabitifyClient(context.env.HABITIFY_API_KEY, context.fetchFn);
   try {
-    const habits = await habitify.listHabits();
+    const habits = raw ? await habitify.listHabitsRaw() : await habitify.listHabits();
     return Response.json(habits);
   } catch (error) {
+    if (error instanceof HabitInputValidationError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
     // The thrown error's message already omits the API key (see HabitifyClient.listHabits), so
     // it's safe to surface directly here.
+    return Response.json(
+      { error: `Habitify request failed: ${error instanceof Error ? error.message : String(error)}` },
+      { status: 502 },
+    );
+  }
+}
+
+// Lets an operator see the day-by-day journal view Habitify's own app renders for a given
+// date — completion status and progress per habit — so it can be compared against GET /habits
+// (or its `?raw=1` payload) when a habit that exists via the API doesn't appear as expected in
+// the app. `?date=YYYY-MM-DD` selects the day; omitted, Habitify defaults to today in the
+// account's own timezone.
+async function handleJournal(request: Request, context: RouteContext): Promise<Response> {
+  if (!context.env.HABITIFY_API_KEY) {
+    return Response.json({ error: "HABITIFY_API_KEY is not configured" }, { status: 503 });
+  }
+  const url = new URL(request.url);
+  const habitify = new HabitifyClient(context.env.HABITIFY_API_KEY, context.fetchFn);
+  try {
+    const journal = await habitify.getJournalRaw(url.searchParams.get("date") ?? undefined);
+    return Response.json(journal);
+  } catch (error) {
+    if (error instanceof HabitInputValidationError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
     return Response.json(
       { error: `Habitify request failed: ${error instanceof Error ? error.message : String(error)}` },
       { status: 502 },
@@ -111,8 +145,9 @@ async function handleCreateHabit(request: Request, context: RouteContext): Promi
 const CORE_ROUTES: IntegrationRoute[] = [
   { method: "POST", path: "/sync", auth: "admin", handler: handleSync },
   { method: "GET", path: "/status", auth: "admin", handler: (_request, context) => handleStatus(context.env) },
-  { method: "GET", path: "/habits", auth: "admin", handler: (_request, context) => handleListHabits(context) },
+  { method: "GET", path: "/habits", auth: "admin", handler: handleListHabits },
   { method: "POST", path: "/habits", auth: "admin", handler: handleCreateHabit },
+  { method: "GET", path: "/journal", auth: "admin", handler: handleJournal },
 ];
 
 // Builds a lookup table keyed by "METHOD path" from a flat list of routes (core routes plus

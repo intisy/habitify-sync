@@ -154,7 +154,9 @@ one-time setup steps (OAuth consent, callback domains, and the like):
 | `POST /sync` (optional `?source=strava\|wakatime\|kindle`) | `admin` | Force a sync of all integrations, or just one |
 | `GET /status` | `admin` | Last run outcome per integration |
 | `GET /habits` | `admin` | List Habitify habit ids/names/units, for filling into `wrangler.toml` |
+| `GET /habits?raw=1` | `admin` | Same route, untrimmed — full Habitify habit objects (scheduling, area, time-of-day, archived flag, etc.), for diagnosing what Habitify actually stores versus what the app displays |
 | `POST /habits` | `admin` | Create a new Habitify habit, so one exists to log into before `wrangler.toml` is filled in |
+| `GET /journal` (optional `?date=YYYY-MM-DD`) | `admin` | The day-by-day journal view Habitify's own app renders for a date, for diagnosing what Habitify actually stores versus what the app displays |
 | `GET /strava/authorize` | `admin-or-query-token` | Start the one-time Strava OAuth flow ([details](src/integrations/strava/README.md#routes)) |
 | `GET /strava/callback` | `public` | Finishes the Strava OAuth exchange ([details](src/integrations/strava/README.md#routes)) |
 | `PUT /kindle/session` | `admin` | Store the captured Kindle session ([details](src/integrations/kindle/README.md#routes)) |

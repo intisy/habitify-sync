@@ -127,6 +127,11 @@ function assertValidCreateHabitInput(input: CreateHabitInput): void {
   }
 }
 
+// The only shape GET /habits/journal's optional `date` query parameter accepts, per the
+// Habitify v2 docs. Checked locally so a malformed date surfaces as a 400 naming the expected
+// format rather than a 502 built from whatever Habitify's own validation error looks like.
+const JOURNAL_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 export class HabitifyClient {
   constructor(
     private readonly apiKey: string,
@@ -177,6 +182,47 @@ export class HabitifyClient {
       if (summary) summaries.push(summary);
     }
     return summaries;
+  }
+
+  // Returns the GET /habits response body completely untouched, deliberately bypassing the
+  // trimming listHabits performs above — this is a diagnostic escape hatch for cases where the
+  // trimmed { id, name, unit } shape hides the field that explains unexpected behavior (e.g. a
+  // habit's scheduling, area, time-of-day assignment, archived flag, or created timestamp).
+  async listHabitsRaw(): Promise<unknown> {
+    // Same detach-before-call reasoning as in request() and listHabits() above.
+    const performFetch = this.fetchFn;
+    const response = await performFetch(`${this.baseUrl}/habits`, {
+      method: "GET",
+      headers: { "X-API-Key": this.apiKey },
+    });
+    if (!response.ok) {
+      throw new Error(`Habitify GET /habits failed with status ${response.status}: ${await response.text()}`);
+    }
+    return (await response.json()) as unknown;
+  }
+
+  // Returns the GET /habits/journal response body completely untouched — the day-by-day view
+  // Habitify's own app renders for a given date (completion status and progress per habit) — so
+  // it can be compared against listHabits/listHabitsRaw to diagnose a habit that exists via the
+  // API but doesn't appear as expected in the app. Also a diagnostic escape hatch, same as
+  // listHabitsRaw above.
+  async getJournalRaw(date?: string): Promise<unknown> {
+    if (date !== undefined && !JOURNAL_DATE_PATTERN.test(date)) {
+      throw new HabitInputValidationError(`Invalid journal date "${date}". Expected format: YYYY-MM-DD`);
+    }
+    const path = date === undefined ? "/habits/journal" : `/habits/journal?date=${date}`;
+    // Same detach-before-call reasoning as in request() and listHabits() above.
+    const performFetch = this.fetchFn;
+    const response = await performFetch(`${this.baseUrl}${path}`, {
+      method: "GET",
+      headers: { "X-API-Key": this.apiKey },
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Habitify GET /habits/journal failed with status ${response.status}: ${await response.text()}`,
+      );
+    }
+    return (await response.json()) as unknown;
   }
 
   // Creates a new Habitify habit so an operator can provision one to log into without ever
