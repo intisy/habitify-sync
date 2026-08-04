@@ -7,6 +7,7 @@ manually and checking status. It currently ships two integrations:
 
 - **[Strava](src/integrations/strava/README.md)** — activity minutes
 - **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes
+- **[Kindle](src/integrations/kindle/README.md)** — pages read, unverified against a live account
 
 ## How it works
 
@@ -55,14 +56,16 @@ the same hour with the same source data converges to the same result.
    otherwise.
 
 3. Find your Habitify habit ids and fill them into `wrangler.toml`
-   (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`):
+   (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`):
 
    ```bash
    curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits
    ```
 
-   Make sure each habit's unit in Habitify is set to minutes — the worker
-   always logs Strava and WakaTime values as minutes (`unit_type: "min"`).
+   Make sure each habit's unit in Habitify matches what the worker logs:
+   minutes for Strava and WakaTime, pages for Kindle. Leave `HABIT_ID_KINDLE`
+   blank to leave that integration disabled — see its README for why it
+   ships unverified.
 
 4. Local development: copy `.dev.vars.example` to `.dev.vars` (already
    gitignored) and fill in real values, then:
@@ -101,15 +104,18 @@ one-time setup steps (OAuth consent, callback domains, and the like):
 
 - **[Strava setup](src/integrations/strava/README.md#setup)**
 - **[WakaTime setup](src/integrations/wakatime/README.md#setup)**
+- **[Kindle setup](src/integrations/kindle/README.md#setup)**
 
 ## HTTP API
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `POST /sync` (optional `?source=strava\|wakatime`) | `admin` | Force a sync of all integrations, or just one |
+| `POST /sync` (optional `?source=strava\|wakatime\|kindle`) | `admin` | Force a sync of all integrations, or just one |
 | `GET /status` | `admin` | Last run outcome per integration |
 | `GET /strava/authorize` | `admin-or-query-token` | Start the one-time Strava OAuth flow ([details](src/integrations/strava/README.md#routes)) |
 | `GET /strava/callback` | `public` | Finishes the Strava OAuth exchange ([details](src/integrations/strava/README.md#routes)) |
+| `PUT /kindle/session` | `admin` | Store the captured Kindle session ([details](src/integrations/kindle/README.md#routes)) |
+| `DELETE /kindle/session` | `admin` | Clear the stored Kindle session ([details](src/integrations/kindle/README.md#routes)) |
 
 Every route requires `Authorization: Bearer <ADMIN_TOKEN>` **except** routes
 declared `public` (currently only `GET /strava/callback`, called directly by
@@ -206,15 +212,6 @@ No other file needs to change — `src/index.ts` builds its route table from
   in the `wrangler`/Miniflare dev toolchain (devDependencies only). The
   worker itself ships with zero runtime dependencies — nothing from those
   packages is included in what's deployed.
-
-## Kindle
-
-Planned, not implemented. Amazon exposes no page-count data reachable with
-session cookies for this use case: the reading-insights endpoint returns
-only streaks, `percentageRead` is always `0`, and the endpoints that carry
-actual reading position and page data return 403. See the design doc's
-["Kindle — Not implemented"](docs/superpowers/specs/2026-08-04-habitify-sync-design.md#kindle--not-implemented)
-section for the full probe results.
 
 ## Development
 
