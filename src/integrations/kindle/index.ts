@@ -12,10 +12,17 @@ const GET_DEVICE_TOKEN_URL = "https://read.amazon.com/service/web/register/getDe
 const LIBRARY_URL = "https://read.amazon.com/kindle-library/search";
 const START_READING_URL = "https://read.amazon.com/service/mobile/reader/startReading";
 
-// Roughly one printed page of prose per Whispersync position unit; used only when neither a
-// pageNumberUrl map nor book metadata is available. Overridable via the KINDLE_POSITIONS_PER_PAGE
-// var since this constant is itself an estimate, not a documented Amazon value.
-const DEFAULT_POSITIONS_PER_PAGE = 1400;
+// The Kindle Cloud Reader's own device identity, verified live against a real account. It is a
+// constant for every account and every book — NOT a per-user value — so it is used as both the
+// serialNumber and deviceType query params and the user never captures or supplies one.
+const KINDLE_DEVICE_ID = "A2CTZ977SKFQZY";
+
+// One printed page of prose per Whispersync position unit, as a last-resort estimate for books
+// with no usable pageNumberUrl map (verified to be every book tested in practice — see README).
+// Grounded in three verified books: Deep Work worked out to ~1500 positions/page, C Programming
+// Language to ~2070, and the dense, small-print ESV Bible to ~5600. 1800 splits the difference for
+// normal prose while accepting that dense reference books will over-count pages.
+const DEFAULT_POSITIONS_PER_PAGE = 1800;
 
 // This integration's own KV keys — not shared generic state.
 export const KINDLE_STATE_KEYS = {
@@ -25,21 +32,22 @@ export const KINDLE_STATE_KEYS = {
 
 export interface KindleSession {
   cookie: string;
-  deviceSerialNumber: string;
-  deviceType: string;
   updatedAt: string;
 }
 
+// The per-day baseline: each book's Whispersync position at the first time it was seen this local
+// day. Storing raw positions (rather than derived pages) means a page-count delta is computed once
+// from a single position delta, instead of compounding rounding error across two independent
+// per-sync page derivations.
 export interface KindlePositions {
   date: string;
-  pages: Record<string, number>;
+  positions: Record<string, number>;
   estimated: boolean;
 }
 
 interface LibraryItem {
   asin: string;
   title: string;
-  percentageRead: number;
   resourceType: string;
   originType: string;
 }
@@ -51,49 +59,78 @@ interface LibraryResponse {
 }
 
 interface StartReadingResponse {
-  lastPageReadData?: { position: number; syncTime?: number; deviceName?: string };
+  // Verified null for a personal document, and also the shape for a book that's never been
+  // opened (position -1). Both mean "nothing to track" for this book.
+  lastPageReadData: { deviceName?: string; position: number; syncTime?: number } | null;
   pageNumberUrl?: string;
   metadataUrl?: string;
-  srl?: unknown;
-  formatVersion?: unknown;
-  contentVersion?: unknown;
 }
 
-function kindleHeaders(cookie: string): HeadersInit {
+interface BookMetadata {
+  startPosition: number;
+  endPosition: number;
+}
+
+interface BookReading {
+  position: number;
+  pageNumberUrl?: string;
+  metadataUrl?: string;
+}
+
+// Diagnostic, per-book progress — carried on the returned HabitValue's `diagnostics` field purely
+// so GET /status is useful for a human to sanity-check; not used in any math here, and never sent
+// to Habitify (see the comment above the POST body in habitify.ts).
+interface KindleBookDiagnostic {
+  asin: string;
+  title: string;
+  progress: number;
+}
+
+// Amazon's own JavaScript promotes the session-id cookie to this request header for the ADP-gated
+// endpoints. Without it, getDeviceToken and startReading both return 403 "The given request is not
+// an ADP session request" — verified against a live account. With it, both return 200.
+function extractSessionId(cookie: string): string | null {
+  const match = cookie.match(/(?:^|;\s*)session-id=([^;]+)/);
+  return match ? match[1] : null;
+}
+
+function kindleHeaders(cookie: string, sessionId: string): HeadersInit {
   return {
     Cookie: cookie,
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    Accept: "application/json",
+    Accept: "application/json, text/plain, */*",
     Referer: "https://read.amazon.com/kindle-library",
+    "x-amzn-sessionid": sessionId,
   };
 }
 
-// The field carrying the device session token is not confirmed by either reverse-engineering
-// source used to write this integration; handle the documented name plus two plausible
-// fallbacks, and refuse to guess further than that.
-async function fetchDeviceSessionToken(session: KindleSession, fetchFn: typeof fetch): Promise<string> {
-  const url = `${GET_DEVICE_TOKEN_URL}?serialNumber=${encodeURIComponent(session.deviceSerialNumber)}&deviceType=${encodeURIComponent(session.deviceType)}`;
-  const response = await fetchFn(url, { headers: kindleHeaders(session.cookie) });
+async function fetchDeviceSessionToken(cookie: string, sessionId: string, fetchFn: typeof fetch): Promise<string> {
+  const url = `${GET_DEVICE_TOKEN_URL}?serialNumber=${KINDLE_DEVICE_ID}&deviceType=${KINDLE_DEVICE_ID}`;
+  const response = await fetchFn(url, { headers: kindleHeaders(cookie, sessionId) });
   if (response.status >= 400 && response.status < 500) {
-    throw new AuthNeededError("Kindle device token capture looks stale; redo the /kindle/session capture");
+    throw new AuthNeededError("Kindle getDeviceToken rejected the stored cookie; redo the /kindle/session capture");
   }
   if (!response.ok) {
     throw new Error(`Kindle getDeviceToken failed with status ${response.status}`);
   }
-  const body = (await response.json()) as Record<string, unknown>;
-  const token = body.deviceSessionToken ?? body.deviceToken ?? body.token;
-  if (typeof token !== "string" || token.length === 0) {
+  const body = (await response.json()) as { deviceSessionToken?: unknown };
+  if (typeof body.deviceSessionToken !== "string" || body.deviceSessionToken.length === 0) {
     throw new AuthNeededError(
-      "Kindle getDeviceToken response had no usable token field; the capture looks stale and must be redone",
+      "Kindle getDeviceToken response had no deviceSessionToken; redo the /kindle/session capture",
     );
   }
-  return token;
+  return body.deviceSessionToken;
 }
 
-async function fetchLibrary(session: KindleSession, fetchFn: typeof fetch): Promise<LibraryItem[]> {
+async function fetchLibrary(cookie: string, sessionId: string, fetchFn: typeof fetch): Promise<LibraryItem[]> {
   const url = `${LIBRARY_URL}?query=&libraryType=BOOKS&sortType=recency&querySize=50`;
-  const response = await fetchFn(url, { headers: kindleHeaders(session.cookie) });
+  const response = await fetchFn(url, { headers: kindleHeaders(cookie, sessionId) });
+  if (response.status === 401 || response.status === 403) {
+    // The cookie can be rejected here even after getDeviceToken succeeded (e.g. it's since
+    // expired) — that's still a re-capture situation, not a generic error.
+    throw new AuthNeededError("Kindle library search rejected the stored cookie; redo the /kindle/session capture");
+  }
   if (!response.ok) {
     throw new Error(`Kindle library request failed with status ${response.status}`);
   }
@@ -104,11 +141,30 @@ async function fetchLibrary(session: KindleSession, fetchFn: typeof fetch): Prom
   return body.itemsList;
 }
 
-// pageNumberUrl's response schema is not documented by either reverse-engineering source; accept
-// a bare array of positions (its index is the page number) or an object wrapping such an array
-// under "pageNumbers" or "positions". Anything else is treated as unusable. This also assumes the
-// array is monotonically non-decreasing (each entry's position >= the one before it), which is
-// likewise unconfirmed — pageFromPositionMap's linear scan relies on that ordering.
+async function fetchBookReading(
+  asin: string,
+  cookie: string,
+  sessionId: string,
+  deviceSessionToken: string,
+  fetchFn: typeof fetch,
+): Promise<BookReading | null> {
+  const url = `${START_READING_URL}?asin=${encodeURIComponent(asin)}&clientVersion=20000100`;
+  const response = await fetchFn(url, {
+    headers: { ...kindleHeaders(cookie, sessionId), "x-adp-session-token": deviceSessionToken },
+  });
+  if (!response.ok) {
+    throw new Error(`Kindle startReading failed for ${asin} with status ${response.status}`);
+  }
+  const body = (await response.json()) as StartReadingResponse;
+  if (!body.lastPageReadData || body.lastPageReadData.position < 0) {
+    return null;
+  }
+  return { position: body.lastPageReadData.position, pageNumberUrl: body.pageNumberUrl, metadataUrl: body.metadataUrl };
+}
+
+// pageNumberUrl's response schema was never observed live (absent on every book tested), so this
+// stays defensive: accept a bare array of positions (its index is the page number) or an object
+// wrapping such an array under "pageNumbers" or "positions", and treat anything else as unusable.
 function parsePageNumberMap(raw: unknown): number[] | null {
   if (Array.isArray(raw) && raw.every((value) => typeof value === "number")) {
     return raw as number[];
@@ -138,9 +194,9 @@ function pageFromPositionMap(map: number[], position: number): number | null {
   return page;
 }
 
-// pageNumberUrl and metadataUrl are presigned URLs fetched without cookies; both are best-effort
-// per the design doc, so any failure here falls back to the next page-derivation strategy rather
-// than failing the book.
+// pageNumberUrl is a presigned URL fetched without cookies, and is opportunistic/best-effort — it
+// was absent for every book verified live, so any failure here just falls back to the position
+// estimate rather than failing the book.
 async function fetchPageNumberMap(url: string, fetchFn: typeof fetch): Promise<number[] | null> {
   try {
     const response = await fetchFn(url);
@@ -151,12 +207,13 @@ async function fetchPageNumberMap(url: string, fetchFn: typeof fetch): Promise<n
   }
 }
 
-// metadataUrl may return JSONP (a bare function-call wrapper around the JSON body). The wrapper's
-// callback name is not documented, so it's stripped generically: a leading identifier plus "(",
-// and a trailing ")" with an optional ";".
-function parseMetadataResponse(text: string): { startPosition: number; endPosition: number } | null {
+// metadataUrl returns JSONP — a bare function-call wrapper around the JSON body, e.g.
+// `loadMetadata({...});` — rather than plain JSON. The wrapper's callback name isn't fixed, so it's
+// stripped generically: a leading identifier plus "(", the body, then ")" with an optional ";",
+// tolerating surrounding whitespace.
+function parseMetadataResponse(text: string): BookMetadata | null {
   const trimmed = text.trim();
-  const jsonpMatch = trimmed.match(/^[A-Za-z0-9_$]+\((.*)\);?$/s);
+  const jsonpMatch = trimmed.match(/^[A-Za-z0-9_$]+\(([\s\S]*)\)\s*;?\s*$/);
   const jsonText = jsonpMatch ? jsonpMatch[1] : trimmed;
   try {
     const parsed = JSON.parse(jsonText) as Record<string, unknown>;
@@ -169,10 +226,8 @@ function parseMetadataResponse(text: string): { startPosition: number; endPositi
   return null;
 }
 
-async function fetchMetadata(
-  url: string,
-  fetchFn: typeof fetch,
-): Promise<{ startPosition: number; endPosition: number } | null> {
+// metadataUrl is a presigned, cross-origin URL — fetched with no cookies and no extra headers.
+async function fetchMetadata(url: string, fetchFn: typeof fetch): Promise<BookMetadata | null> {
   try {
     const response = await fetchFn(url);
     if (!response.ok) return null;
@@ -182,54 +237,36 @@ async function fetchMetadata(
   }
 }
 
-// Three-tier page derivation, most to least authoritative:
-//   1. pageNumberUrl map — a real printed-page lookup, when the book exposes one.
-//   2. percentage x known page count — metadata's endPosition is used to estimate a total page
-//      count (endPosition / positionsPerPage), which Amazon's own percentageRead then scales.
-//      Neither reverse-engineering source specifies where a "known page count" would otherwise
-//      come from, so this is an inferred reading of the design doc's tier 2, not a confirmed one.
-//   3. position / positionsPerPage — a rough estimate with no book-specific grounding at all.
-// Tiers 2 and 3 are marked `estimated: true`; only tier 1 is not.
-function derivePage(input: {
-  position: number;
-  pageNumberMap: number[] | null;
-  metadata: { startPosition: number; endPosition: number } | null;
-  percentageRead: number;
-  positionsPerPage: number;
-}): { page: number; estimated: boolean } {
-  if (input.pageNumberMap) {
-    const mapped = pageFromPositionMap(input.pageNumberMap, input.position);
-    if (mapped !== null) return { page: mapped, estimated: false };
-  }
-  if (input.metadata && input.metadata.endPosition > input.metadata.startPosition && Number.isFinite(input.percentageRead)) {
-    const estimatedTotalPages = Math.max(1, Math.round(input.metadata.endPosition / input.positionsPerPage));
-    return { page: Math.round((input.percentageRead / 100) * estimatedTotalPages), estimated: true };
-  }
-  return { page: Math.floor(input.position / input.positionsPerPage), estimated: true };
+// Verified against three real books (~1.8%, ~42%, ~75%): this is the actual progress fraction,
+// unlike Amazon's own percentageRead field, which is verified to return 0 for every book even when
+// well underway. Returns null for a metadata span that isn't positive, so the caller can omit the
+// book from diagnostics entirely rather than report a misleading 0%.
+function progressFraction(position: number, metadata: BookMetadata): number | null {
+  const span = metadata.endPosition - metadata.startPosition;
+  if (span <= 0) return null;
+  return Math.min(1, Math.max(0, (position - metadata.startPosition) / span));
 }
 
-async function fetchBookPage(
-  item: LibraryItem,
-  session: KindleSession,
-  deviceSessionToken: string,
+// Converts a position delta since the book's baseline into a page-count delta. Prefers a real
+// printed-page lookup (pageFromPositionMap applied to both the baseline and current position, so
+// both ends go through the same map) when the book has a usable pageNumberUrl map; falls back to
+// the position/positionsPerPage estimate otherwise. Never negative — a book re-read from an
+// earlier position doesn't subtract from the day's total.
+function pagesSinceBaseline(
+  baselinePosition: number,
+  currentPosition: number,
+  pageNumberMap: number[] | null,
   positionsPerPage: number,
-  fetchFn: typeof fetch,
-): Promise<{ page: number; estimated: boolean }> {
-  const url = `${START_READING_URL}?asin=${encodeURIComponent(item.asin)}&clientVersion=20000100`;
-  const response = await fetchFn(url, {
-    headers: { ...kindleHeaders(session.cookie), "x-adp-session-token": deviceSessionToken },
-  });
-  if (!response.ok) {
-    throw new Error(`Kindle startReading failed for ${item.asin} with status ${response.status}`);
+): { pages: number; estimated: boolean } {
+  if (pageNumberMap) {
+    const baselinePage = pageFromPositionMap(pageNumberMap, baselinePosition);
+    const currentPage = pageFromPositionMap(pageNumberMap, currentPosition);
+    if (baselinePage !== null && currentPage !== null) {
+      return { pages: Math.max(0, currentPage - baselinePage), estimated: false };
+    }
   }
-  const body = (await response.json()) as StartReadingResponse;
-  const position = body.lastPageReadData?.position;
-  if (typeof position !== "number") {
-    throw new Error(`Kindle startReading for ${item.asin} had no reading position`);
-  }
-  const pageNumberMap = body.pageNumberUrl ? await fetchPageNumberMap(body.pageNumberUrl, fetchFn) : null;
-  const metadata = body.metadataUrl ? await fetchMetadata(body.metadataUrl, fetchFn) : null;
-  return derivePage({ position, pageNumberMap, metadata, percentageRead: item.percentageRead, positionsPerPage });
+  const positionDelta = currentPosition - baselinePosition;
+  return { pages: Math.max(0, positionDelta / positionsPerPage), estimated: true };
 }
 
 async function handlePutSession(request: Request, context: RouteContext): Promise<Response> {
@@ -240,27 +277,13 @@ async function handlePutSession(request: Request, context: RouteContext): Promis
     return Response.json({ error: "malformed JSON body" }, { status: 400 });
   }
   const candidate = body as Record<string, unknown> | null;
-  const isValid =
-    candidate !== null &&
-    typeof candidate === "object" &&
-    typeof candidate.cookie === "string" &&
-    candidate.cookie.length > 0 &&
-    typeof candidate.deviceSerialNumber === "string" &&
-    candidate.deviceSerialNumber.length > 0 &&
-    typeof candidate.deviceType === "string" &&
-    candidate.deviceType.length > 0;
-  if (!isValid) {
-    return Response.json(
-      { error: "expected { cookie, deviceSerialNumber, deviceType } as non-empty strings" },
-      { status: 400 },
-    );
+  const cookie = candidate !== null && typeof candidate === "object" ? candidate.cookie : undefined;
+  if (typeof cookie !== "string" || cookie.length === 0) {
+    return Response.json({ error: "expected { cookie } as a non-empty string" }, { status: 400 });
   }
-  const session: KindleSession = {
-    cookie: candidate.cookie as string,
-    deviceSerialNumber: candidate.deviceSerialNumber as string,
-    deviceType: candidate.deviceType as string,
-    updatedAt: new Date().toISOString(),
-  };
+  // deviceSerialNumber/deviceType are accepted-and-ignored for backward compatibility with callers
+  // still sending the pre-verification shape; they're no longer needed (see KINDLE_DEVICE_ID above).
+  const session: KindleSession = { cookie, updatedAt: new Date().toISOString() };
   await writeJson(context.env.STATE, KINDLE_STATE_KEYS.session, session);
   return new Response(null, { status: 204 });
 }
@@ -283,70 +306,98 @@ export const kindleIntegration: Integration = {
     if (!session) {
       throw new AuthNeededError("Kindle session not captured; PUT /kindle/session");
     }
+    const sessionId = extractSessionId(session.cookie);
+    if (!sessionId) {
+      throw new AuthNeededError(
+        "Kindle cookie is missing session-id; redo the /kindle/session capture with the full Cookie header",
+      );
+    }
 
-    const deviceSessionToken = await fetchDeviceSessionToken(session, fetchFn);
-    const library = await fetchLibrary(session, fetchFn);
-    const positionsPerPage = Number(env.KINDLE_POSITIONS_PER_PAGE) || DEFAULT_POSITIONS_PER_PAGE;
+    const deviceSessionToken = await fetchDeviceSessionToken(session.cookie, sessionId, fetchFn);
+    const library = await fetchLibrary(session.cookie, sessionId, fetchFn);
+    // Guarded against a nonsensical override (0, negative, or unparseable) producing a bogus,
+    // inflated page count.
+    const positionsPerPage = Math.max(1, Number(env.KINDLE_POSITIONS_PER_PAGE) || DEFAULT_POSITIONS_PER_PAGE);
 
-    const currentPages: Record<string, number> = {};
-    let anyEstimated = false;
+    const currentPositions: Record<string, number> = {};
+    const pageNumberMaps: Record<string, number[] | null> = {};
+    const bookDiagnostics: KindleBookDiagnostic[] = [];
+    let errorCount = 0;
     let lastBookError: Error | undefined;
 
     for (const item of library) {
       try {
-        const { page, estimated } = await fetchBookPage(item, session, deviceSessionToken, positionsPerPage, fetchFn);
-        currentPages[item.asin] = page;
-        if (estimated) anyEstimated = true;
+        const reading = await fetchBookReading(item.asin, session.cookie, sessionId, deviceSessionToken, fetchFn);
+        // A personal document, or a book never opened (position -1): nothing to track, silently.
+        if (reading === null) continue;
+
+        currentPositions[item.asin] = reading.position;
+        pageNumberMaps[item.asin] = reading.pageNumberUrl
+          ? await fetchPageNumberMap(reading.pageNumberUrl, fetchFn)
+          : null;
+
+        if (reading.metadataUrl) {
+          const metadata = await fetchMetadata(reading.metadataUrl, fetchFn);
+          const progress = metadata ? progressFraction(reading.position, metadata) : null;
+          // A null progress means the metadata span wasn't positive — omit the book rather than
+          // report a misleading 0%.
+          if (progress !== null) {
+            bookDiagnostics.push({ asin: item.asin, title: item.title, progress });
+          }
+        }
       } catch (error) {
         // A book failing individually doesn't fail the whole source — only the aggregate below
         // (every book failing) does.
+        errorCount++;
         lastBookError = error instanceof Error ? error : new Error(String(error));
       }
     }
 
-    if (library.length > 0 && Object.keys(currentPages).length === 0) {
+    if (library.length > 0 && errorCount === library.length) {
       throw lastBookError ?? new Error("Every Kindle book failed to sync");
     }
 
     const previous = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
+    // A fresh local day starts the baseline empty, which — via the "no baseline yet" branch below —
+    // records every current position as its own baseline and contributes 0, exactly like a book
+    // seen for the first time mid-day. This single loop covers both cases.
+    const mergedBaseline: Record<string, number> = previous && previous.date === today ? { ...previous.positions } : {};
+
     let total = 0;
-    if (!previous || previous.date !== today) {
-      // New local day: the baseline resets to today's current readings, so today's value starts
-      // at 0 rather than retroactively inventing progress.
-      await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
-        date: today,
-        pages: currentPages,
-        estimated: anyEstimated,
-      } satisfies KindlePositions);
-    } else {
-      // Same local day: compare against the baseline captured at the first sync of the day, not
-      // against the previous sync, so the reported value is cumulative for the whole day. A book
-      // with no baseline entry (first seen mid-day) records its current page as its baseline right
-      // now — contributing 0 to this sync's total — so that the NEXT sync measures its progress
-      // from here, rather than from 0 forever. Existing baselines are never moved forward here;
-      // only a book that has never had a baseline this local day gets one. Books absent from this
-      // run's library fetch (a transient failure, or removed from the library) keep their stored
-      // baseline via the spread below, so a book that reappears later is still measured from its
-      // original baseline rather than treated as newly seen.
-      const mergedBaseline: Record<string, number> = { ...previous.pages };
-      for (const [asin, page] of Object.entries(currentPages)) {
-        const baselinePage = mergedBaseline[asin];
-        if (baselinePage === undefined) {
-          mergedBaseline[asin] = page;
-          continue;
-        }
-        total += Math.max(0, page - baselinePage);
+    let anyEstimated = false;
+    for (const [asin, position] of Object.entries(currentPositions)) {
+      const pageNumberMap = pageNumberMaps[asin] ?? null;
+      const baselinePosition = mergedBaseline[asin];
+      if (baselinePosition === undefined) {
+        // First time seen this local day: record the baseline now so the NEXT sync measures
+        // progress from here, rather than from 0 forever. Contributes 0 to this sync's total, but
+        // still reports whether this book has a real page map available, for a truthful status.
+        mergedBaseline[asin] = position;
+        if (!pageNumberMap) anyEstimated = true;
+        continue;
       }
-      // Written on every sync (even when total is 0) so a mid-day first sighting's baseline is
-      // actually persisted, not just computed and discarded.
-      await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
-        date: today,
-        pages: mergedBaseline,
-        estimated: anyEstimated,
-      } satisfies KindlePositions);
+      const { pages, estimated } = pagesSinceBaseline(baselinePosition, position, pageNumberMap, positionsPerPage);
+      total += pages;
+      if (estimated) anyEstimated = true;
     }
 
-    return [{ habitId: env.HABIT_ID_KINDLE!, value: total, unit: "pages" }];
+    // Written on every sync (even when total is 0) so a mid-day first sighting's baseline is
+    // actually persisted, and books absent from this run (transient failure, or removed from the
+    // library) keep their existing baseline via the spread above, so a book that reappears later is
+    // still measured from its original baseline rather than treated as newly seen.
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: today,
+      positions: mergedBaseline,
+      estimated: anyEstimated,
+    } satisfies KindlePositions);
+
+    const habitValue: HabitValue = {
+      habitId: env.HABIT_ID_KINDLE!,
+      value: Math.round(total),
+      unit: "pages",
+      diagnostics: { estimated: anyEstimated, books: bookDiagnostics },
+    };
+    return [habitValue];
   },
 
   routes: [

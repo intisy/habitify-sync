@@ -7,7 +7,7 @@ manually and checking status. It currently ships three integrations:
 
 - **[Strava](src/integrations/strava/README.md)** — activity minutes
 - **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes
-- **[Kindle](src/integrations/kindle/README.md)** — pages read, unverified against a live account
+- **[Kindle](src/integrations/kindle/README.md)** — pages read, verified live against a real Amazon account (estimated, since Amazon exposes no real page map)
 
 ## How it works
 
@@ -64,8 +64,8 @@ the same hour with the same source data converges to the same result.
 
    Make sure each habit's unit in Habitify matches what the worker logs:
    minutes for Strava and WakaTime, pages for Kindle. Leave `HABIT_ID_KINDLE`
-   blank to leave that integration disabled — see its README for why it
-   ships unverified.
+   blank to leave that integration disabled — see its README for the
+   one-time Amazon cookie capture it needs instead.
 
 4. Local development: copy `.dev.vars.example` to `.dev.vars` (already
    gitignored) and fill in real values, then:

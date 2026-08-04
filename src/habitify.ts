@@ -26,6 +26,9 @@ export class HabitifyClient {
     const { start, end } = isoDayRange(timeZone, now);
     const range = `?from=${encodeURIComponent(start)}&to=${encodeURIComponent(end)}`;
     await this.request("DELETE", `/logs/${habit.habitId}${range}`);
+    // List fields explicitly here — never spread a HabitValue into the body. HabitValue can carry
+    // a `diagnostics` object meant only for GET /status, and it must never leave for this
+    // third-party API.
     await this.request("POST", `/logs/${habit.habitId}`, {
       unit_type: habit.unit,
       value: habit.value,

@@ -16,6 +16,8 @@ export interface HabitValue {
   habitId: string;
   value: number;
   unit: string;
+  /** Integration-specific diagnostics surfaced via GET /status. Never sent to Habitify. */
+  diagnostics?: Record<string, unknown>;
 }
 
 export interface SourceContext {

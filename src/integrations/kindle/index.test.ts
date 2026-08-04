@@ -2,40 +2,62 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeEach, describe, expect, it } from "vitest";
 import worker, { handleFetch } from "../../index";
 import { readJson, writeJson } from "../../state";
-import { AuthNeededError, type Env, type SourceContext } from "../types";
+import { AuthNeededError, type Env, type HabitValue, type SourceContext } from "../types";
 import { KINDLE_STATE_KEYS, kindleIntegration, type KindlePositions, type KindleSession } from "./index";
+
+// Kindle's own diagnostics shape, nested under HabitValue.diagnostics — never sent to Habitify,
+// only surfaced via GET /status. Extracting it needs one narrow cast from `unknown` (diagnostics
+// is intentionally a loosely-typed bag), not the whole-object cast this used to require.
+interface KindleDiagnostics {
+  estimated: boolean;
+  books: { asin: string; title: string; progress: number }[];
+}
+
+function diagnosticsOf(value: HabitValue): KindleDiagnostics | undefined {
+  return value.diagnostics as KindleDiagnostics | undefined;
+}
 
 const DEVICE_TOKEN_URL = "https://read.amazon.com/service/web/register/getDeviceToken";
 const LIBRARY_URL = "https://read.amazon.com/kindle-library/search";
 const START_READING_URL = "https://read.amazon.com/service/mobile/reader/startReading";
 
+// A fake but well-formed Amazon cookie header — never a real value. session-id is the piece the
+// integration promotes to the x-amzn-sessionid header.
 const DUMMY_SESSION: KindleSession = {
-  cookie: "session-id=000-0000000-0000000; ubid-main=000-0000000-0000000",
-  deviceSerialNumber: "TESTSERIAL0001",
-  deviceType: "A1TESTDEVICETYPE",
+  cookie: "session-id=999-0000000-0000000; at-main=DUMMY; ubid-main=999-1111111-1111111",
   updatedAt: "2026-08-01T00:00:00.000Z",
 };
+const DUMMY_SESSION_ID = "999-0000000-0000000";
+
+// Three real books' verified startPosition/endPosition, used to ground the progress-fraction tests.
+const DEEP_WORK = { asin: "ASINDEEPWORK01", startPosition: 3, endPosition: 456177, position: 8047 };
+const C_PROGRAMMING_LANGUAGE = { asin: "ASINCPROGLANG1", startPosition: 3, endPosition: 563246, position: 238526 };
+const ESV_BIBLE = { asin: "ASINESVBIBLE01", startPosition: 3, endPosition: 6960680, position: 5238294 };
 
 function makeContext(testEnv: Env, fetchFn: typeof fetch, today = "2026-08-04"): SourceContext {
   return { env: testEnv, timeZone: "Europe/Berlin", today, now: new Date(`${today}T10:00:00Z`), fetchFn };
 }
 
-function kindleEnv(): Env {
-  return { ...env, HABIT_ID_KINDLE: "habit-k" };
+function kindleEnv(overrides: Partial<Env> = {}): Env {
+  return { ...env, HABIT_ID_KINDLE: "habit-k", ...overrides };
 }
 
-function libraryResponse(items: { asin: string; percentageRead: number }[]) {
+function libraryResponse(asins: string[]) {
   return Response.json({
-    itemsList: items.map((item) => ({
-      asin: item.asin,
-      title: `Book ${item.asin}`,
-      percentageRead: item.percentageRead,
+    itemsList: asins.map((asin) => ({
+      asin,
+      title: `Book ${asin}`,
+      percentageRead: 0, // verified to always be 0 live; the integration never reads this field
       resourceType: "EBOOK",
       originType: "PURCHASE",
     })),
     libraryType: "BOOKS",
     sortType: "recency",
   });
+}
+
+function jsonp(body: Record<string, unknown>): string {
+  return `loadMetadata(${JSON.stringify(body)});`;
 }
 
 beforeEach(async () => {
@@ -59,6 +81,17 @@ describe("kindleIntegration.fetchToday - auth", () => {
     await expect(kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
   });
 
+  it("throws AuthNeededError when the stored cookie lacks session-id", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, {
+      cookie: "at-main=DUMMY; ubid-main=999-1111111-1111111",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+    } satisfies KindleSession);
+    const fetchFn = (async () => {
+      throw new Error("fetch should not be called when session-id is missing");
+    }) as typeof fetch;
+    await expect(kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
+  });
+
   it("throws AuthNeededError when getDeviceToken returns a 4xx status", async () => {
     await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
     const fetchFn = (async (input: RequestInfo | URL) => {
@@ -68,125 +101,94 @@ describe("kindleIntegration.fetchToday - auth", () => {
     await expect(kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
   });
 
-  it("throws AuthNeededError when getDeviceToken's body has no usable token field", async () => {
+  it("throws AuthNeededError when getDeviceToken's body has no deviceSessionToken field", async () => {
     await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
     const fetchFn = (async (input: RequestInfo | URL) => {
       expect(String(input)).toContain(DEVICE_TOKEN_URL);
-      return Response.json({ somethingElse: "no token here" });
+      return Response.json({ clientHashId: "x", deviceName: "y", eid: "z" });
     }) as typeof fetch;
     await expect(kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
   });
+
+  it("sends x-amzn-sessionid on getDeviceToken, library search, and startReading, plus x-adp-session-token on startReading", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    const seenHeaders: { url: string; headers: Headers }[] = [];
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      seenHeaders.push({ url, headers: new Headers(init?.headers) });
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "a".repeat(1481) });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(START_READING_URL)) return Response.json({ lastPageReadData: { position: 100 } });
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+
+    const deviceTokenCall = seenHeaders.find((call) => call.url.startsWith(DEVICE_TOKEN_URL))!;
+    expect(deviceTokenCall.headers.get("x-amzn-sessionid")).toBe(DUMMY_SESSION_ID);
+
+    const libraryCall = seenHeaders.find((call) => call.url.startsWith(LIBRARY_URL))!;
+    expect(libraryCall.headers.get("x-amzn-sessionid")).toBe(DUMMY_SESSION_ID);
+
+    const startReadingCall = seenHeaders.find((call) => call.url.startsWith(START_READING_URL))!;
+    expect(startReadingCall.headers.get("x-amzn-sessionid")).toBe(DUMMY_SESSION_ID);
+    expect(startReadingCall.headers.get("x-adp-session-token")).toBe("a".repeat(1481));
+  });
+
+  it("throws AuthNeededError when the library search returns 401", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return new Response("unauthorized", { status: 401 });
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+    await expect(kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
+  });
+
+  it("uses the constant device id as both serialNumber and deviceType, with no per-user capture", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) {
+        const parsed = new URL(url);
+        expect(parsed.searchParams.get("serialNumber")).toBe("A2CTZ977SKFQZY");
+        expect(parsed.searchParams.get("deviceType")).toBe("A2CTZ977SKFQZY");
+        return Response.json({ deviceSessionToken: "token" });
+      }
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse([]);
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+  });
 });
 
-describe("kindleIntegration.fetchToday - happy path and baseline/delta", () => {
+describe("kindleIntegration.fetchToday - skipped books", () => {
   beforeEach(async () => {
     await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
   });
 
-  function makeFetch(positionsByAsin: Record<string, number>, sentTokens: string[]) {
-    return (async (input: RequestInfo | URL, init?: RequestInit) => {
+  it("silently skips a book with lastPageReadData: null and one with position: -1, without failing the sync", async () => {
+    const fetchFn = (async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.startsWith(DEVICE_TOKEN_URL)) {
-        return Response.json({ deviceSessionToken: "adp-session-token-1" });
-      }
-      if (url.startsWith(LIBRARY_URL)) {
-        return libraryResponse(Object.keys(positionsByAsin).map((asin) => ({ asin, percentageRead: 0 })));
-      }
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["PDOC", "NEVER_OPENED", "NORMAL"]);
       if (url.startsWith(START_READING_URL)) {
         const asin = new URL(url).searchParams.get("asin")!;
-        sentTokens.push(new Headers(init?.headers).get("x-adp-session-token") ?? "");
-        return Response.json({ lastPageReadData: { position: positionsByAsin[asin], syncTime: 1 } });
+        if (asin === "PDOC") return Response.json({ lastPageReadData: null });
+        if (asin === "NEVER_OPENED") return Response.json({ lastPageReadData: { position: -1 } });
+        return Response.json({ lastPageReadData: { position: 1800 } });
       }
       throw new Error(`unexpected fetch to ${url}`);
     }) as typeof fetch;
-  }
-
-  it("establishes a baseline on the first sync of the day and returns 0", async () => {
-    const sentTokens: string[] = [];
-    const fetchFn = makeFetch({ ASIN1: 1400, ASIN2: 2800 }, sentTokens);
 
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
 
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    expect(sentTokens).toEqual(["adp-session-token-1", "adp-session-token-1"]);
-
+    expect(values).toEqual([expect.objectContaining({ habitId: "habit-k", value: 0, unit: "pages" })]);
     const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    expect(stored).toEqual({ date: "2026-08-04", pages: { ASIN1: 1, ASIN2: 2 }, estimated: true });
-  });
-
-  it("returns the page delta on a second sync the same day", async () => {
-    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
-      date: "2026-08-04",
-      pages: { ASIN1: 1, ASIN2: 2 },
-      estimated: true,
-    } satisfies KindlePositions);
-
-    const fetchFn = makeFetch({ ASIN1: 2900, ASIN2: 4300 }, []);
-    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-
-    // ASIN1: floor(2900/1400) = 2, delta 1. ASIN2: floor(4300/1400) = 3, delta 1. Total 2.
-    expect(values).toEqual([{ habitId: "habit-k", value: 2, unit: "pages" }]);
-  });
-
-  it("does not establish a new baseline for a different day than local 'today'", async () => {
-    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
-      date: "2026-08-03",
-      pages: { ASIN1: 5, ASIN2: 5 },
-      estimated: true,
-    } satisfies KindlePositions);
-
-    const fetchFn = makeFetch({ ASIN1: 1400, ASIN2: 2800 }, []);
-    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-
-    // Stale baseline is from a previous day, so today resets to 0 rather than using it.
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    expect(stored?.date).toBe("2026-08-04");
-  });
-
-  it("gives a book first seen mid-day a baseline, then credits its progress on the next sync", async () => {
-    // Sync 1: only ASIN1 exists. Establishes the day's baseline.
-    const sync1 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({ ASIN1: 1400 }, [])));
-    expect(sync1).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-
-    // Sync 2: ASIN1 advances, and ASIN2 appears for the first time today. Only ASIN1's advance
-    // should count — ASIN2 gets its baseline recorded now, contributing 0 this sync.
-    const sync2 = await kindleIntegration.fetchToday(
-      makeContext(kindleEnv(), makeFetch({ ASIN1: 2800, ASIN2: 1400 }, [])),
-    );
-    expect(sync2).toEqual([{ habitId: "habit-k", value: 1, unit: "pages" }]);
-    const afterSync2 = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    // ASIN1's baseline is untouched (still 1, its sync-1 page); ASIN2's baseline is now recorded
-    // as the page it had when first seen (1), not lost as it would be without persisting it here.
-    expect(afterSync2?.pages).toEqual({ ASIN1: 1, ASIN2: 1 });
-
-    // Sync 3: both books advance further. ASIN2's delta must be measured from the page it had at
-    // sync 2 (1), not from 0 and not from its current page — this is the exact case that was
-    // broken when the same-day branch never wrote back a merged baseline.
-    const sync3 = await kindleIntegration.fetchToday(
-      makeContext(kindleEnv(), makeFetch({ ASIN1: 4200, ASIN2: 2900 }, [])),
-    );
-    // ASIN1: floor(4200/1400) = 3, baseline 1, delta 2. ASIN2: floor(2900/1400) = 2, baseline 1, delta 1.
-    expect(sync3).toEqual([{ habitId: "habit-k", value: 3, unit: "pages" }]);
-  });
-
-  it("preserves a book's baseline across a sync where it's absent, so it isn't lost on reappearance", async () => {
-    // Sync 1: ASIN1 exists, establishing its baseline.
-    const sync1 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({ ASIN1: 1400 }, [])));
-    expect(sync1).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-
-    // Sync 2: the library is empty (e.g. the book briefly failed to sync or dropped out of the
-    // list). Its stored baseline must survive this sync untouched.
-    const sync2 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({}, [])));
-    expect(sync2).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    const afterSync2 = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    expect(afterSync2?.pages).toEqual({ ASIN1: 1 });
-
-    // Sync 3: ASIN1 reappears with a higher page. The delta must be measured from its original
-    // sync-1 baseline (1), not from 0 as if it were newly seen this sync.
-    const sync3 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({ ASIN1: 4200 }, [])));
-    // floor(4200/1400) = 3, baseline 1, delta 2.
-    expect(sync3).toEqual([{ habitId: "habit-k", value: 2, unit: "pages" }]);
+    // Only the normal book's baseline is recorded; the two skipped books never appear.
+    expect(stored?.positions).toEqual({ NORMAL: 1800 });
   });
 });
 
@@ -199,33 +201,27 @@ describe("kindleIntegration.fetchToday - per-book failure isolation", () => {
     const fetchFn = (async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
-      if (url.startsWith(LIBRARY_URL)) {
-        return libraryResponse([
-          { asin: "BROKEN", percentageRead: 0 },
-          { asin: "GOOD", percentageRead: 0 },
-        ]);
-      }
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["BROKEN", "GOOD"]);
       if (url.startsWith(START_READING_URL)) {
         const asin = new URL(url).searchParams.get("asin")!;
         if (asin === "BROKEN") return new Response("server error", { status: 500 });
-        return Response.json({ lastPageReadData: { position: 1400 } });
+        return Response.json({ lastPageReadData: { position: 1800 } });
       }
       throw new Error(`unexpected fetch to ${url}`);
     }) as typeof fetch;
 
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
 
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
+    expect(values).toEqual([expect.objectContaining({ habitId: "habit-k", value: 0, unit: "pages" })]);
     const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    // Only the successful book made it into the baseline; the broken one is simply absent.
-    expect(stored?.pages).toEqual({ GOOD: 1 });
+    expect(stored?.positions).toEqual({ GOOD: 1800 });
   });
 
   it("throws naming the last failure when every book fails", async () => {
     const fetchFn = (async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
-      if (url.startsWith(LIBRARY_URL)) return libraryResponse([{ asin: "ASIN1", percentageRead: 0 }]);
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
       if (url.startsWith(START_READING_URL)) return new Response("server error", { status: 503 });
       throw new Error(`unexpected fetch to ${url}`);
     }) as typeof fetch;
@@ -234,78 +230,301 @@ describe("kindleIntegration.fetchToday - per-book failure isolation", () => {
   });
 });
 
-describe("kindleIntegration.fetchToday - page derivation tiers", () => {
+describe("kindleIntegration.fetchToday - metadata JSONP and progress fraction", () => {
   beforeEach(async () => {
     await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
   });
 
-  function fetchFor(startReadingBody: Record<string, unknown>, extra?: Record<string, () => Response>) {
+  function fetchForBooks(books: { asin: string; position: number; startPosition: number; endPosition: number }[]) {
     return (async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
-      if (url.startsWith(LIBRARY_URL)) return libraryResponse([{ asin: "ASIN1", percentageRead: 10 }]);
-      if (url.startsWith(START_READING_URL)) return Response.json(startReadingBody);
-      if (extra?.[url]) return extra[url]();
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(books.map((book) => book.asin));
+      if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        const book = books.find((candidate) => candidate.asin === asin)!;
+        return Response.json({
+          lastPageReadData: { position: book.position },
+          metadataUrl: `https://cdn.example.com/metadata/${asin}`,
+        });
+      }
+      const metadataMatch = url.match(/metadata\/(.+)$/);
+      if (metadataMatch) {
+        const book = books.find((candidate) => candidate.asin === metadataMatch[1])!;
+        return new Response(jsonp({ startPosition: book.startPosition, endPosition: book.endPosition }));
+      }
       throw new Error(`unexpected fetch to ${url}`);
     }) as typeof fetch;
   }
 
-  it("tier 1: uses the pageNumberUrl map as the authoritative page when it parses", async () => {
-    const fetchFn = fetchFor(
-      { lastPageReadData: { position: 2900 }, pageNumberUrl: "https://cdn.example.com/pagemap/asin1" },
-      { "https://cdn.example.com/pagemap/asin1": () => Response.json([0, 1400, 2800, 4200]) },
-    );
+  it("unwraps JSONP with a trailing ); and surrounding whitespace", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(START_READING_URL)) {
+        return Response.json({
+          lastPageReadData: { position: DEEP_WORK.position },
+          metadataUrl: "https://cdn.example.com/metadata/asin1",
+        });
+      }
+      if (url === "https://cdn.example.com/metadata/asin1") {
+        return new Response(
+          `  \n  identifier(   {"startPosition":${DEEP_WORK.startPosition},"endPosition":${DEEP_WORK.endPosition},"bookSize":999999}   )  ;  \n  `,
+        );
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    // map[2] = 2800 <= 2900 < map[3] = 4200, so page index 2, and tier 1 is not an estimate.
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    expect(stored).toEqual({ date: "2026-08-04", pages: { ASIN1: 2 }, estimated: false });
+    const books = diagnosticsOf(values[0])?.books;
+    expect(books).toHaveLength(1);
+    expect(books?.[0].progress).toBeCloseTo(0.018, 2);
   });
 
-  it("tier 1: an unparseable pageNumberUrl falls through to the next strategy", async () => {
-    const fetchFn = fetchFor(
-      { lastPageReadData: { position: 1400 }, pageNumberUrl: "https://cdn.example.com/pagemap/bad" },
-      { "https://cdn.example.com/pagemap/bad": () => Response.json({ unexpectedShape: true }) },
-    );
+  it("computes the progress fraction correctly for the three verified books", async () => {
+    const fetchFn = fetchForBooks([DEEP_WORK, C_PROGRAMMING_LANGUAGE, ESV_BIBLE]);
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    // No metadataUrl either, so it falls all the way to tier 3: floor(1400/1400) = 1, estimated.
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    expect(stored).toEqual({ date: "2026-08-04", pages: { ASIN1: 1 }, estimated: true });
+    const books = diagnosticsOf(values[0])?.books ?? [];
+    const byAsin = Object.fromEntries(books.map((book) => [book.asin, book.progress]));
+    expect(byAsin[DEEP_WORK.asin]).toBeCloseTo(0.018, 2);
+    expect(byAsin[C_PROGRAMMING_LANGUAGE.asin]).toBeCloseTo(0.42, 2);
+    expect(byAsin[ESV_BIBLE.asin]).toBeCloseTo(0.75, 2);
   });
 
-  it("tier 2: derives a page from percentageRead and metadata's endPosition when no page map is available", async () => {
-    const fetchFn = fetchFor(
-      { lastPageReadData: { position: 14000 }, metadataUrl: "https://cdn.example.com/metadata/asin1" },
-      {
-        "https://cdn.example.com/metadata/asin1": () =>
-          new Response('someCallback({"startPosition":0,"endPosition":140000})'),
-      },
-    );
+  it("omits a book from diagnostics when the metadata span is not positive", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(START_READING_URL)) {
+        return Response.json({
+          lastPageReadData: { position: 100 },
+          metadataUrl: "https://cdn.example.com/metadata/degenerate",
+        });
+      }
+      if (url === "https://cdn.example.com/metadata/degenerate") {
+        // endPosition <= startPosition: a degenerate span that would otherwise report a
+        // misleading 0% rather than being omitted.
+        return new Response(jsonp({ startPosition: 100, endPosition: 100 }));
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    // estimatedTotalPages = round(140000/1400) = 100; page = round(10/100 * 100) = 10.
-    const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    expect(stored).toEqual({ date: "2026-08-04", pages: { ASIN1: 10 }, estimated: true });
+    expect(diagnosticsOf(values[0])?.books).toEqual([]);
+  });
+});
+
+describe("kindleIntegration.fetchToday - page delta math and baseline lifecycle", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
   });
 
-  it("tier 3: falls back to position / positionsPerPage when no map or metadata is usable", async () => {
-    const fetchFn = fetchFor({ lastPageReadData: { position: 2800 } });
+  function fetchForPositions(positionsByAsin: Record<string, number>) {
+    return (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(Object.keys(positionsByAsin));
+      if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        return Response.json({ lastPageReadData: { position: positionsByAsin[asin] } });
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+  }
+
+  it("establishes a baseline on the first sync of the day and returns 0", async () => {
+    const fetchFn = fetchForPositions({ ASIN1: 1000, ASIN2: 2000 });
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ habitId: "habit-k", value: 0, unit: "pages" })]);
     const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    expect(stored).toEqual({ date: "2026-08-04", pages: { ASIN1: 2 }, estimated: true });
+    // No pageNumberUrl on either book, so the sync truthfully reports estimated even though the
+    // total itself is 0 (a fresh baseline never invents progress).
+    expect(stored).toEqual({ date: "2026-08-04", positions: { ASIN1: 1000, ASIN2: 2000 }, estimated: true });
   });
 
-  it("tier 3: also used when the metadataUrl fetch fails, treating it as best-effort", async () => {
-    const fetchFn = fetchFor(
-      { lastPageReadData: { position: 1400 }, metadataUrl: "https://cdn.example.com/metadata/down" },
-      { "https://cdn.example.com/metadata/down": () => new Response("gateway timeout", { status: 504 }) },
-    );
+  it("yields the position delta divided by POSITIONS_PER_PAGE on a later sync using the default var", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN1: 1000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const fetchFn = fetchForPositions({ ASIN1: 1000 + 3600 }); // delta 3600, default 1800/page => 2 pages
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ value: 2 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
+  });
+
+  it("honors KINDLE_POSITIONS_PER_PAGE when overridden", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN1: 1000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const fetchFn = fetchForPositions({ ASIN1: 1000 + 3600 }); // delta 3600, 900/page override => 4 pages
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_POSITIONS_PER_PAGE: "900" }), fetchFn),
+    );
+    expect(values).toEqual([expect.objectContaining({ value: 4 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
+  });
+
+  it("guards a negative KINDLE_POSITIONS_PER_PAGE override up to a minimum of 1", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN1: 1000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    // "0" would fall back to the default via `Number(...) || DEFAULT`, since 0 is falsy — this
+    // wouldn't exercise the guard. A negative value is truthy, so it survives that fallback and
+    // must be caught by Math.max(1, ...) instead, or it would produce a nonsensical inflated
+    // (or, for an exact divisor, negative) page count.
+    const fetchFn = fetchForPositions({ ASIN1: 1000 + 3600 });
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_POSITIONS_PER_PAGE: "-100" }), fetchFn),
+    );
+    // Guarded to 1 position/page, so this is 3600 pages, not a negative or otherwise bogus number.
+    expect(values).toEqual([expect.objectContaining({ value: 3600 })]);
+  });
+
+  it("sums fractional per-book estimates before rounding once at the end", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN_A: 1000, ASIN_B: 2000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    // Each book advances by 900 positions — half of the default 1800/page — so each contributes
+    // exactly 0.5 pages. Rounding each book independently (0.5 -> 1) would wrongly total 2; summing
+    // the floats first and rounding once yields 1.
+    const fetchFn = fetchForPositions({ ASIN_A: 1900, ASIN_B: 2900 });
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ value: 1 })]);
+  });
+
+  it("does not establish a new baseline for a different day than local 'today'", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-03",
+      positions: { ASIN1: 5000, ASIN2: 5000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const fetchFn = fetchForPositions({ ASIN1: 1000, ASIN2: 2000 });
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+
+    expect(values).toEqual([expect.objectContaining({ value: 0 })]);
     const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
-    expect(values).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
-    expect(stored).toEqual({ date: "2026-08-04", pages: { ASIN1: 1 }, estimated: true });
+    expect(stored?.date).toBe("2026-08-04");
+  });
+
+  it("gives a book first seen mid-day a baseline, then credits its progress on the next sync", async () => {
+    // Sync 1: only ASIN1 exists. Establishes the day's baseline.
+    const sync1 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchForPositions({ ASIN1: 1000 })));
+    expect(sync1).toEqual([expect.objectContaining({ value: 0 })]);
+
+    // Sync 2: ASIN1 advances by 1800 (=> 1 page), and ASIN2 appears for the first time today. Only
+    // ASIN1's advance should count — ASIN2 gets its baseline recorded now, contributing 0.
+    const sync2 = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv(), fetchForPositions({ ASIN1: 2800, ASIN2: 500 })),
+    );
+    expect(sync2).toEqual([expect.objectContaining({ value: 1 })]);
+    const afterSync2 = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
+    expect(afterSync2?.positions).toEqual({ ASIN1: 1000, ASIN2: 500 });
+
+    // Sync 3: both books advance further. ASIN2's delta must be measured from the position it had
+    // at sync 2 (500), not from 0 and not from its current position.
+    const sync3 = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv(), fetchForPositions({ ASIN1: 4600, ASIN2: 2300 })),
+    );
+    // ASIN1: (4600-1000)/1800 = 2. ASIN2: (2300-500)/1800 = 1. Total 3.
+    expect(sync3).toEqual([expect.objectContaining({ value: 3 })]);
+  });
+
+  it("preserves a book's baseline across a sync where it's absent, so it isn't lost on reappearance", async () => {
+    // Sync 1: ASIN1 exists, establishing its baseline.
+    const sync1 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchForPositions({ ASIN1: 1000 })));
+    expect(sync1).toEqual([expect.objectContaining({ value: 0 })]);
+
+    // Sync 2: the library is empty (e.g. the book briefly failed to sync). Its baseline must survive.
+    const sync2 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchForPositions({})));
+    expect(sync2).toEqual([expect.objectContaining({ value: 0 })]);
+    const afterSync2 = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
+    expect(afterSync2?.positions).toEqual({ ASIN1: 1000 });
+
+    // Sync 3: ASIN1 reappears with a higher position. The delta must be measured from its original
+    // sync-1 baseline (1000), not from 0 as if it were newly seen this sync.
+    const sync3 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchForPositions({ ASIN1: 4600 })));
+    // (4600-1000)/1800 = 2.
+    expect(sync3).toEqual([expect.objectContaining({ value: 2 })]);
+  });
+});
+
+describe("kindleIntegration.fetchToday - pageNumberUrl preferred when usable", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+  });
+
+  it("uses the real page map for the delta instead of the position estimate when it parses", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN1: 1000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(START_READING_URL)) {
+        return Response.json({
+          lastPageReadData: { position: 4600 },
+          pageNumberUrl: "https://cdn.example.com/pagemap/asin1",
+        });
+      }
+      if (url === "https://cdn.example.com/pagemap/asin1") {
+        // map[i] is the starting position of page i; 1000 -> page 1, 4600 -> page 4
+        return Response.json([0, 1000, 2200, 3400, 4600, 5800]);
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    // page(4600) - page(1000) = 4 - 1 = 3, and this path is not an estimate.
+    expect(values).toEqual([expect.objectContaining({ value: 3 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(false);
+  });
+
+  it("falls back to the position estimate when the pageNumberUrl map is unparseable", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN1: 1000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(START_READING_URL)) {
+        return Response.json({
+          lastPageReadData: { position: 4600 },
+          pageNumberUrl: "https://cdn.example.com/pagemap/bad",
+        });
+      }
+      if (url === "https://cdn.example.com/pagemap/bad") return Response.json({ unexpectedShape: true });
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    // (4600-1000)/1800 = 2, estimated.
+    expect(values).toEqual([expect.objectContaining({ value: 2 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
   });
 });
 
@@ -320,22 +539,35 @@ async function request(path: string, init?: RequestInit): Promise<Response> {
 }
 
 describe("PUT /kindle/session", () => {
-  it("stores a valid session and returns 204", async () => {
+  it("stores a valid session with only { cookie } and returns 204", async () => {
+    const response = await request("/kindle/session", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ cookie: "session-id=1-2-3; at-main=DUMMY" }),
+    });
+
+    expect(response.status).toBe(204);
+    const stored = await readJson<KindleSession>(env.STATE, KINDLE_STATE_KEYS.session);
+    expect(stored?.cookie).toBe("session-id=1-2-3; at-main=DUMMY");
+    expect(stored).not.toHaveProperty("deviceSerialNumber");
+    expect(stored).not.toHaveProperty("deviceType");
+  });
+
+  it("accepts and ignores a body that still carries the old deviceSerialNumber/deviceType fields", async () => {
     const response = await request("/kindle/session", {
       method: "PUT",
       headers: { ...bearer, "Content-Type": "application/json" },
       body: JSON.stringify({
-        cookie: "session-id=1-2-3",
-        deviceSerialNumber: "SERIAL-ABC",
-        deviceType: "A1SOMETYPE",
+        cookie: "session-id=1-2-3; at-main=DUMMY",
+        deviceSerialNumber: "OLD-SERIAL",
+        deviceType: "OLD-TYPE",
       }),
     });
 
     expect(response.status).toBe(204);
     const stored = await readJson<KindleSession>(env.STATE, KINDLE_STATE_KEYS.session);
-    expect(stored?.cookie).toBe("session-id=1-2-3");
-    expect(stored?.deviceSerialNumber).toBe("SERIAL-ABC");
-    expect(stored?.deviceType).toBe("A1SOMETYPE");
+    expect(stored?.cookie).toBe("session-id=1-2-3; at-main=DUMMY");
+    expect(stored).not.toHaveProperty("deviceSerialNumber");
   });
 
   it("returns 400 for a malformed JSON body", async () => {
@@ -349,11 +581,11 @@ describe("PUT /kindle/session", () => {
     expect(body.error).toBeTruthy();
   });
 
-  it("returns 400 when a required field is missing or empty", async () => {
+  it("returns 400 when cookie is missing or empty", async () => {
     const response = await request("/kindle/session", {
       method: "PUT",
       headers: { ...bearer, "Content-Type": "application/json" },
-      body: JSON.stringify({ cookie: "abc", deviceSerialNumber: "", deviceType: "A1SOMETYPE" }),
+      body: JSON.stringify({ cookie: "" }),
     });
     expect(response.status).toBe(400);
   });
