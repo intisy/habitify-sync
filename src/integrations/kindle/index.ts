@@ -77,17 +77,13 @@ interface BookReading {
   metadataUrl?: string;
 }
 
-// Diagnostic, per-book progress — carried on the returned HabitValue (see KindleHabitValue below)
-// purely so GET /status is useful for a human to sanity-check, not used in any math here.
+// Diagnostic, per-book progress — carried on the returned HabitValue's `diagnostics` field purely
+// so GET /status is useful for a human to sanity-check; not used in any math here, and never sent
+// to Habitify (see the comment above the POST body in habitify.ts).
 interface KindleBookDiagnostic {
   asin: string;
   title: string;
   progress: number;
-}
-
-interface KindleHabitValue extends HabitValue {
-  estimated: boolean;
-  books: KindleBookDiagnostic[];
 }
 
 // Amazon's own JavaScript promotes the session-id cookie to this request header for the ADP-gated
@@ -130,6 +126,11 @@ async function fetchDeviceSessionToken(cookie: string, sessionId: string, fetchF
 async function fetchLibrary(cookie: string, sessionId: string, fetchFn: typeof fetch): Promise<LibraryItem[]> {
   const url = `${LIBRARY_URL}?query=&libraryType=BOOKS&sortType=recency&querySize=50`;
   const response = await fetchFn(url, { headers: kindleHeaders(cookie, sessionId) });
+  if (response.status === 401 || response.status === 403) {
+    // The cookie can be rejected here even after getDeviceToken succeeded (e.g. it's since
+    // expired) — that's still a re-capture situation, not a generic error.
+    throw new AuthNeededError("Kindle library search rejected the stored cookie; redo the /kindle/session capture");
+  }
   if (!response.ok) {
     throw new Error(`Kindle library request failed with status ${response.status}`);
   }
@@ -238,10 +239,11 @@ async function fetchMetadata(url: string, fetchFn: typeof fetch): Promise<BookMe
 
 // Verified against three real books (~1.8%, ~42%, ~75%): this is the actual progress fraction,
 // unlike Amazon's own percentageRead field, which is verified to return 0 for every book even when
-// well underway.
-function progressFraction(position: number, metadata: BookMetadata): number {
+// well underway. Returns null for a metadata span that isn't positive, so the caller can omit the
+// book from diagnostics entirely rather than report a misleading 0%.
+function progressFraction(position: number, metadata: BookMetadata): number | null {
   const span = metadata.endPosition - metadata.startPosition;
-  if (span <= 0) return 0;
+  if (span <= 0) return null;
   return Math.min(1, Math.max(0, (position - metadata.startPosition) / span));
 }
 
@@ -313,7 +315,9 @@ export const kindleIntegration: Integration = {
 
     const deviceSessionToken = await fetchDeviceSessionToken(session.cookie, sessionId, fetchFn);
     const library = await fetchLibrary(session.cookie, sessionId, fetchFn);
-    const positionsPerPage = Number(env.KINDLE_POSITIONS_PER_PAGE) || DEFAULT_POSITIONS_PER_PAGE;
+    // Guarded against a nonsensical override (0, negative, or unparseable) producing a bogus,
+    // inflated page count.
+    const positionsPerPage = Math.max(1, Number(env.KINDLE_POSITIONS_PER_PAGE) || DEFAULT_POSITIONS_PER_PAGE);
 
     const currentPositions: Record<string, number> = {};
     const pageNumberMaps: Record<string, number[] | null> = {};
@@ -334,12 +338,11 @@ export const kindleIntegration: Integration = {
 
         if (reading.metadataUrl) {
           const metadata = await fetchMetadata(reading.metadataUrl, fetchFn);
-          if (metadata) {
-            bookDiagnostics.push({
-              asin: item.asin,
-              title: item.title,
-              progress: progressFraction(reading.position, metadata),
-            });
+          const progress = metadata ? progressFraction(reading.position, metadata) : null;
+          // A null progress means the metadata span wasn't positive — omit the book rather than
+          // report a misleading 0%.
+          if (progress !== null) {
+            bookDiagnostics.push({ asin: item.asin, title: item.title, progress });
           }
         }
       } catch (error) {
@@ -388,12 +391,11 @@ export const kindleIntegration: Integration = {
       estimated: anyEstimated,
     } satisfies KindlePositions);
 
-    const habitValue: KindleHabitValue = {
+    const habitValue: HabitValue = {
       habitId: env.HABIT_ID_KINDLE!,
       value: Math.round(total),
       unit: "pages",
-      estimated: anyEstimated,
-      books: bookDiagnostics,
+      diagnostics: { estimated: anyEstimated, books: bookDiagnostics },
     };
     return [habitValue];
   },
