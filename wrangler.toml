@@ -1,0 +1,16 @@
+name = "habitify-sync"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+
+[triggers]
+crons = ["0 * * * *"]
+
+[vars]
+TIMEZONE = "Europe/Berlin"
+HABIT_ID_KINDLE = ""
+HABIT_ID_STRAVA = ""
+HABIT_ID_WAKATIME = ""
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "0000000000000000000000000000000000000000"
