@@ -12,7 +12,7 @@ Habitify habit configured by `HABIT_ID_STRAVA`. Value is the sum of
 |---|---|---|
 | `STRAVA_CLIENT_ID` | Secret | Strava API application at [strava.com/settings/api](https://www.strava.com/settings/api) |
 | `STRAVA_CLIENT_SECRET` | Secret | Same Strava API application |
-| `HABIT_ID_STRAVA` | Var (`wrangler.toml`) | `curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits` |
+| `HABIT_ID_STRAVA` | Var (`wrangler.toml`) | `curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits`, or `GET /habits` on the deployed worker |
 
 ## Setup
 

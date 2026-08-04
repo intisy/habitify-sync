@@ -151,9 +151,22 @@ OAuth callback.
 
 ## Idempotency & error handling
 
-- Habitify's API appends logs, so upsert = `DELETE` today's logs for the habit,
-  then `POST` the current total. Hourly reruns converge to the correct daily
-  value.
+- Habitify's API appends logs, so upsert = undo today's logs for the habit
+  (`POST /habits/{habitId}/logs/undo`), then `POST` the current total. Hourly
+  reruns converge to the correct daily value.
+
+  **2026-08-05 update:** Habitify's v1 API (`https://api.habitify.me`,
+  `Authorization: <key>`, `DELETE /logs/{id}?from=&to=`) was retired; a live
+  `GET /habits` call started returning 401. The client was rewritten against
+  the authoritative v2 OpenAPI spec: base URL `https://api.habitify.me/v2`,
+  auth header `X-API-Key`, and — since v2 has no range-delete for logs, only
+  a per-log `DELETE /habits/{habitId}/logs/{logId}` with no way to list log
+  ids — the upsert's delete step became `POST /habits/{habitId}/logs/undo`
+  instead of a date-range `DELETE`. Also new in v2: each habit's own
+  configured unit (from its first `goal.unit`) is looked up once per sync run
+  and preferred over an integration's declared unit, since Habitify's unit
+  symbols are a closed enum that doesn't include every semantic unit an
+  integration might declare (e.g. Kindle's `"pages"`).
 - Per-source isolation via try/catch in the orchestrator; failures land in the
   status record, visible through `GET /status`.
 - No retry queues or push notifications in v1 (YAGNI).

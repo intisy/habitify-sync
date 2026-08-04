@@ -1,6 +1,6 @@
-import { HabitifyClient } from "./habitify";
+import { HabitifyClient, isHabitifyUnitSymbol, type HabitifyUnitSymbol } from "./habitify";
 import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "./state";
-import { AuthNeededError, type Env, type Integration, type SourceContext } from "./integrations/types";
+import { AuthNeededError, type Env, type HabitValue, type Integration, type SourceContext } from "./integrations/types";
 import { todayInTimeZone } from "./time";
 
 const DEFAULT_TIME_ZONE = "Europe/Berlin";
@@ -8,6 +8,37 @@ const DEFAULT_TIME_ZONE = "Europe/Berlin";
 export interface SyncResult {
   source: string;
   status: SourceStatus;
+}
+
+// Resolves the Habitify unit symbol actually sent for one value. The habit's OWN configured unit
+// (from Habitify itself) is authoritative over the integration's declared unit: integrations
+// describe a semantic unit ("pages", "min") that may not even be a valid Habitify symbol (Kindle's
+// "pages" is not), so trusting whatever the human configured on the habit is what keeps every
+// write valid without requiring the integration and the habit to agree on a unit string. The
+// integration's declared unit is only a fallback for when Habitify has no unit for that habit (or
+// its habit lookup failed), and "rep" — the generic count unit — is the last resort when neither
+// is a valid Habitify symbol.
+function resolveHabitifyUnit(
+  value: HabitValue,
+  habitUnitsById: ReadonlyMap<string, string>,
+): { unit: HabitifyUnitSymbol; fallbackReason?: string } {
+  const habitUnit = habitUnitsById.get(value.habitId);
+  if (habitUnit !== undefined && isHabitifyUnitSymbol(habitUnit)) {
+    return { unit: habitUnit };
+  }
+  if (isHabitifyUnitSymbol(value.unit)) {
+    return {
+      unit: value.unit,
+      fallbackReason:
+        habitUnit === undefined
+          ? `habit ${value.habitId} has no configured unit; using integration's unit "${value.unit}"`
+          : `habit ${value.habitId}'s configured unit "${habitUnit}" is not a valid Habitify unit; using integration's unit "${value.unit}"`,
+    };
+  }
+  return {
+    unit: "rep",
+    fallbackReason: `habit ${value.habitId} has no valid unit from Habitify or the integration (integration declared "${value.unit}"); falling back to "rep"`,
+  };
 }
 
 export async function runSync(
@@ -45,6 +76,22 @@ export async function runSync(
 
   const habitify = new HabitifyClient(env.HABITIFY_API_KEY, fetchFn);
 
+  // Once per run (not once per habit): look up every habit's own configured unit, so each value
+  // below can defer to it instead of the integration's possibly-invalid declared unit. This costs
+  // one extra API call per run, trivial against Habitify's 500/min rate limit.
+  const habitUnitsById = new Map<string, string>();
+  let habitUnitLookupError: string | undefined;
+  try {
+    for (const habit of await habitify.listHabits()) {
+      if (habit.unit !== undefined) habitUnitsById.set(habit.id, habit.unit);
+    }
+  } catch (error) {
+    // A transient failure to list habits must not block writes for this run — every value just
+    // falls back to its integration-declared unit (or "rep"), the same as a habit Habitify has no
+    // configured unit for.
+    habitUnitLookupError = error instanceof Error ? error.message : String(error);
+  }
+
   for (const source of sources) {
     if (onlySource && source.name !== onlySource) continue;
     const previous = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
@@ -59,10 +106,20 @@ export async function runSync(
     let status: SourceStatus;
     try {
       const values = await source.fetchToday(context);
+      const unitFallbacks: string[] = habitUnitLookupError
+        ? [`could not look up Habitify habit units (${habitUnitLookupError}); using each value's integration-declared unit`]
+        : [];
       for (const value of values) {
-        await habitify.upsertTodayLog(value, timeZone, now);
+        const { unit, fallbackReason } = resolveHabitifyUnit(value, habitUnitsById);
+        if (fallbackReason && !habitUnitLookupError) unitFallbacks.push(fallbackReason);
+        await habitify.upsertTodayLog({ ...value, unit }, timeZone, now);
       }
-      status = { state: "ok", lastSuccessAt: now.toISOString(), values };
+      status = {
+        state: "ok",
+        lastSuccessAt: now.toISOString(),
+        values,
+        ...(unitFallbacks.length > 0 ? { unitFallbacks } : {}),
+      };
     } catch (error) {
       status = {
         state: error instanceof AuthNeededError ? "auth_needed" : "error",

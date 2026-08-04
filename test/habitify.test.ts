@@ -5,18 +5,21 @@ interface RecordedRequest {
   method: string;
   url: string;
   body: string | undefined;
+  apiKey: string | null;
   authorization: string | null;
 }
 
 function recordingFetch(recorded: RecordedRequest[], status = 200): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
     recorded.push({
       method: init?.method ?? "GET",
       url: String(input),
       body: init?.body === undefined ? undefined : String(init.body),
-      authorization: new Headers(init?.headers).get("Authorization"),
+      apiKey: headers.get("X-API-Key"),
+      authorization: headers.get("Authorization"),
     });
-    return new Response(status === 200 ? "{}" : "error", { status });
+    return new Response(status >= 200 && status < 300 ? "{}" : "error", { status });
   }) as typeof fetch;
 }
 
@@ -25,109 +28,159 @@ function jsonFetch(body: unknown, status = 200): typeof fetch {
 }
 
 describe("HabitifyClient.upsertTodayLog", () => {
-  const now = new Date("2026-08-04T10:00:00Z");
+  // 2026-08-04T23:30 UTC is 2026-08-05T01:30 in Europe/Berlin (UTC+2 under DST) — past UTC
+  // midnight but not yet past Berlin midnight, so this proves todayInTimeZone (local calendar
+  // date) is used for targetDate, not a UTC-derived date, which would wrongly read 2026-08-04.
+  const now = new Date("2026-08-04T23:30:00Z");
 
-  it("deletes today's logs then posts the new value", async () => {
+  it("undoes today's logs, then posts the new value, in that order", async () => {
     const recorded: RecordedRequest[] = [];
-    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example");
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
     await client.upsertTodayLog({ habitId: "habit-1", value: 42, unit: "min" }, "Europe/Berlin", now);
 
     expect(recorded).toHaveLength(2);
-    expect(recorded[0].method).toBe("DELETE");
-    expect(recorded[0].url).toBe(
-      "https://habitify.example/logs/habit-1?from=2026-08-04T00%3A00%3A00%2B02%3A00&to=2026-08-04T23%3A59%3A59%2B02%3A00",
-    );
-    expect(recorded[0].authorization).toBe("api-key");
+
+    expect(recorded[0].method).toBe("POST");
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits/habit-1/logs/undo");
+    expect(recorded[0].apiKey).toBe("api-key");
+    expect(recorded[0].authorization).toBeNull();
+    expect(JSON.parse(recorded[0].body!)).toEqual({ targetDate: "2026-08-05" });
+
     expect(recorded[1].method).toBe("POST");
-    expect(recorded[1].url).toBe("https://habitify.example/logs/habit-1");
+    expect(recorded[1].url).toBe("https://habitify.example/v2/habits/habit-1/logs");
+    expect(recorded[1].apiKey).toBe("api-key");
+    expect(recorded[1].authorization).toBeNull();
     expect(JSON.parse(recorded[1].body!)).toEqual({
-      unit_type: "min",
+      unitSymbol: "min",
       value: 42,
-      target_date: "2026-08-04T00:00:00+02:00",
+      targetDate: "2026-08-05",
     });
   });
 
-  it("throws on a non-ok response", async () => {
-    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example");
+  it("accepts a 201 from POST /logs", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 201), "https://habitify.example/v2");
     await expect(
       client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now),
-    ).rejects.toThrow("Habitify DELETE");
+    ).resolves.toBeUndefined();
+  });
+
+  it("throws on a non-ok response from the undo call", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example/v2");
+    await expect(
+      client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now),
+    ).rejects.toThrow("Habitify POST /habits/habit-1/logs/undo failed with status 401");
+  });
+
+  it("throws on a non-ok response from the log-post call", async () => {
+    let callCount = 0;
+    const fetchFn = (async () => {
+      callCount++;
+      // Undo (1st call) succeeds; the log POST (2nd call) fails.
+      return new Response(callCount === 1 ? "{}" : "error", { status: callCount === 1 ? 200 : 422 });
+    }) as typeof fetch;
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    await expect(
+      client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now),
+    ).rejects.toThrow("Habitify POST /habits/habit-1/logs failed with status 422");
+  });
+
+  it("rejects an invalid unitSymbol before making any request", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    await expect(
+      client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "pages" }, "Europe/Berlin", now),
+    ).rejects.toThrow(/Invalid Habitify unitSymbol "pages"/);
+    expect(recorded).toHaveLength(0);
   });
 });
 
 describe("HabitifyClient.listHabits", () => {
-  it("sends the correct URL and the raw-key Authorization header", async () => {
+  it("sends the correct /v2/habits URL and the X-API-Key header, not Authorization", async () => {
     const recorded: RecordedRequest[] = [];
     const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
       recorded.push({
         method: init?.method ?? "GET",
         url: String(input),
         body: init?.body === undefined ? undefined : String(init.body),
-        authorization: new Headers(init?.headers).get("Authorization"),
+        apiKey: headers.get("X-API-Key"),
+        authorization: headers.get("Authorization"),
       });
       return new Response(JSON.stringify({ data: [] }), { status: 200 });
     }) as typeof fetch;
-    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example");
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
     await client.listHabits();
 
     expect(recorded).toHaveLength(1);
     expect(recorded[0].method).toBe("GET");
-    expect(recorded[0].url).toBe("https://habitify.example/habits");
-    expect(recorded[0].authorization).toBe("api-key");
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits");
+    expect(recorded[0].apiKey).toBe("api-key");
+    expect(recorded[0].authorization).toBeNull();
   });
 
-  it("parses a { data: [...] } response into trimmed summaries", async () => {
+  it("parses a { data: [...] } response, taking the unit from the first goal", async () => {
     const client = new HabitifyClient(
       "api-key",
-      jsonFetch({ data: [{ id: "habit-1", name: "Read", unit_type: "pages", extra: "ignored" }] }),
-      "https://habitify.example",
+      jsonFetch({
+        data: [
+          {
+            id: "habit-1",
+            name: "Read",
+            goals: [{ id: "goal-1", createdAt: "2026-01-01T00:00:00Z", periodicity: "daily", value: 1, unit: "rep" }],
+            extra: "ignored",
+          },
+        ],
+      }),
+      "https://habitify.example/v2",
     );
     const habits = await client.listHabits();
-    expect(habits).toEqual([{ id: "habit-1", name: "Read", unit: "pages" }]);
+    expect(habits).toEqual([{ id: "habit-1", name: "Read", unit: "rep" }]);
   });
 
   it("tolerates a bare array response", async () => {
     const client = new HabitifyClient(
       "api-key",
-      jsonFetch([{ id: "habit-2", name: "Run", unit: "min" }]),
-      "https://habitify.example",
+      jsonFetch([{ id: "habit-2", name: "Run", goals: [{ unit: "min" }] }]),
+      "https://habitify.example/v2",
     );
     const habits = await client.listHabits();
     expect(habits).toEqual([{ id: "habit-2", name: "Run", unit: "min" }]);
   });
 
+  it("yields an undefined unit for a habit with no goals", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({ data: [{ id: "habit-3", name: "No goals", goals: [] }] }),
+      "https://habitify.example/v2",
+    );
+    const habits = await client.listHabits();
+    expect(habits).toEqual([{ id: "habit-3", name: "No goals", unit: undefined }]);
+  });
+
+  it("takes the unit from only the FIRST goal when multiple are present", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({
+        data: [{ id: "habit-4", goals: [{ unit: "kg" }, { unit: "min" }] }],
+      }),
+      "https://habitify.example/v2",
+    );
+    const habits = await client.listHabits();
+    expect(habits[0].unit).toBe("kg");
+  });
+
   it("skips entries with no id", async () => {
     const client = new HabitifyClient(
       "api-key",
-      jsonFetch({ data: [{ name: "No id" }, { id: "habit-3", name: "Has id" }] }),
-      "https://habitify.example",
+      jsonFetch({ data: [{ name: "No id" }, { id: "habit-5", name: "Has id", goals: [] }] }),
+      "https://habitify.example/v2",
     );
     const habits = await client.listHabits();
-    expect(habits).toEqual([{ id: "habit-3", name: "Has id", unit: undefined }]);
-  });
-
-  it("prefers unit_type over unit when both are present", async () => {
-    const client = new HabitifyClient(
-      "api-key",
-      jsonFetch({ data: [{ id: "habit-4", unit_type: "pages", unit: "min" }] }),
-      "https://habitify.example",
-    );
-    const habits = await client.listHabits();
-    expect(habits[0].unit).toBe("pages");
-  });
-
-  it("falls back to unit when unit_type is absent", async () => {
-    const client = new HabitifyClient(
-      "api-key",
-      jsonFetch({ data: [{ id: "habit-5", unit: "min" }] }),
-      "https://habitify.example",
-    );
-    const habits = await client.listHabits();
-    expect(habits[0].unit).toBe("min");
+    expect(habits).toEqual([{ id: "habit-5", name: "Has id", unit: undefined }]);
   });
 
   it("throws on a non-ok response", async () => {
-    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example");
+    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example/v2");
     await expect(client.listHabits()).rejects.toThrow("Habitify GET /habits failed with status 401");
   });
 });
@@ -153,7 +206,7 @@ describe("HabitifyClient fetchFn this-binding", () => {
 
   it("invokes fetchFn with this === undefined in upsertTodayLog, not the HabitifyClient instance", async () => {
     const { fetchFn, getRecordedThis } = makeThisRecordingFetch({});
-    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example");
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
     await client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now);
     expect(getRecordedThis()).toBeUndefined();
     expect(getRecordedThis()).not.toBe(client);
@@ -161,7 +214,7 @@ describe("HabitifyClient fetchFn this-binding", () => {
 
   it("invokes fetchFn with this === undefined in listHabits, not the HabitifyClient instance", async () => {
     const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ data: [] });
-    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example");
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
     await client.listHabits();
     expect(getRecordedThis()).toBeUndefined();
     expect(getRecordedThis()).not.toBe(client);
