@@ -143,6 +143,51 @@ describe("kindleIntegration.fetchToday - happy path and baseline/delta", () => {
     const stored = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
     expect(stored?.date).toBe("2026-08-04");
   });
+
+  it("gives a book first seen mid-day a baseline, then credits its progress on the next sync", async () => {
+    // Sync 1: only ASIN1 exists. Establishes the day's baseline.
+    const sync1 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({ ASIN1: 1400 }, [])));
+    expect(sync1).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
+
+    // Sync 2: ASIN1 advances, and ASIN2 appears for the first time today. Only ASIN1's advance
+    // should count — ASIN2 gets its baseline recorded now, contributing 0 this sync.
+    const sync2 = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv(), makeFetch({ ASIN1: 2800, ASIN2: 1400 }, [])),
+    );
+    expect(sync2).toEqual([{ habitId: "habit-k", value: 1, unit: "pages" }]);
+    const afterSync2 = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
+    // ASIN1's baseline is untouched (still 1, its sync-1 page); ASIN2's baseline is now recorded
+    // as the page it had when first seen (1), not lost as it would be without persisting it here.
+    expect(afterSync2?.pages).toEqual({ ASIN1: 1, ASIN2: 1 });
+
+    // Sync 3: both books advance further. ASIN2's delta must be measured from the page it had at
+    // sync 2 (1), not from 0 and not from its current page — this is the exact case that was
+    // broken when the same-day branch never wrote back a merged baseline.
+    const sync3 = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv(), makeFetch({ ASIN1: 4200, ASIN2: 2900 }, [])),
+    );
+    // ASIN1: floor(4200/1400) = 3, baseline 1, delta 2. ASIN2: floor(2900/1400) = 2, baseline 1, delta 1.
+    expect(sync3).toEqual([{ habitId: "habit-k", value: 3, unit: "pages" }]);
+  });
+
+  it("preserves a book's baseline across a sync where it's absent, so it isn't lost on reappearance", async () => {
+    // Sync 1: ASIN1 exists, establishing its baseline.
+    const sync1 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({ ASIN1: 1400 }, [])));
+    expect(sync1).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
+
+    // Sync 2: the library is empty (e.g. the book briefly failed to sync or dropped out of the
+    // list). Its stored baseline must survive this sync untouched.
+    const sync2 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({}, [])));
+    expect(sync2).toEqual([{ habitId: "habit-k", value: 0, unit: "pages" }]);
+    const afterSync2 = await readJson<KindlePositions>(env.STATE, KINDLE_STATE_KEYS.positions);
+    expect(afterSync2?.pages).toEqual({ ASIN1: 1 });
+
+    // Sync 3: ASIN1 reappears with a higher page. The delta must be measured from its original
+    // sync-1 baseline (1), not from 0 as if it were newly seen this sync.
+    const sync3 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch({ ASIN1: 4200 }, [])));
+    // floor(4200/1400) = 3, baseline 1, delta 2.
+    expect(sync3).toEqual([{ habitId: "habit-k", value: 2, unit: "pages" }]);
+  });
 });
 
 describe("kindleIntegration.fetchToday - per-book failure isolation", () => {

@@ -106,7 +106,9 @@ async function fetchLibrary(session: KindleSession, fetchFn: typeof fetch): Prom
 
 // pageNumberUrl's response schema is not documented by either reverse-engineering source; accept
 // a bare array of positions (its index is the page number) or an object wrapping such an array
-// under "pageNumbers" or "positions". Anything else is treated as unusable.
+// under "pageNumbers" or "positions". Anything else is treated as unusable. This also assumes the
+// array is monotonically non-decreasing (each entry's position >= the one before it), which is
+// likewise unconfirmed — pageFromPositionMap's linear scan relies on that ordering.
 function parsePageNumberMap(raw: unknown): number[] | null {
   if (Array.isArray(raw) && raw.every((value) => typeof value === "number")) {
     return raw as number[];
@@ -310,8 +312,7 @@ export const kindleIntegration: Integration = {
     let total = 0;
     if (!previous || previous.date !== today) {
       // New local day: the baseline resets to today's current readings, so today's value starts
-      // at 0 rather than retroactively inventing progress. This baseline is deliberately not
-      // rewritten on later syncs the same day — see the `else` branch below.
+      // at 0 rather than retroactively inventing progress.
       await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
         date: today,
         pages: currentPages,
@@ -320,12 +321,29 @@ export const kindleIntegration: Integration = {
     } else {
       // Same local day: compare against the baseline captured at the first sync of the day, not
       // against the previous sync, so the reported value is cumulative for the whole day. A book
-      // with no baseline entry (newly appeared mid-day) defaults to its own current page, so it
-      // contributes 0 rather than crediting its entire page count as "read today".
+      // with no baseline entry (first seen mid-day) records its current page as its baseline right
+      // now — contributing 0 to this sync's total — so that the NEXT sync measures its progress
+      // from here, rather than from 0 forever. Existing baselines are never moved forward here;
+      // only a book that has never had a baseline this local day gets one. Books absent from this
+      // run's library fetch (a transient failure, or removed from the library) keep their stored
+      // baseline via the spread below, so a book that reappears later is still measured from its
+      // original baseline rather than treated as newly seen.
+      const mergedBaseline: Record<string, number> = { ...previous.pages };
       for (const [asin, page] of Object.entries(currentPages)) {
-        const baselinePage = previous.pages[asin] ?? page;
+        const baselinePage = mergedBaseline[asin];
+        if (baselinePage === undefined) {
+          mergedBaseline[asin] = page;
+          continue;
+        }
         total += Math.max(0, page - baselinePage);
       }
+      // Written on every sync (even when total is 0) so a mid-day first sighting's baseline is
+      // actually persisted, not just computed and discarded.
+      await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+        date: today,
+        pages: mergedBaseline,
+        estimated: anyEstimated,
+      } satisfies KindlePositions);
     }
 
     return [{ habitId: env.HABIT_ID_KINDLE!, value: total, unit: "pages" }];
