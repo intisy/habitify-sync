@@ -1,5 +1,5 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import worker from "../src/index";
 import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus } from "../src/state";
 import type { Env } from "../src/sources/types";
@@ -24,15 +24,28 @@ describe("authentication", () => {
   it("rejects unknown routes with 404", async () => {
     expect((await request("/nope", { headers: bearer })).status).toBe(404);
   });
+
+  it("rejects a query-string token on routes other than /strava/authorize", async () => {
+    expect((await request("/status?token=secret-token")).status).toBe(401);
+  });
 });
 
 describe("GET /status", () => {
-  it("returns stored per-source status", async () => {
+  it("returns stored status for a source no longer in the registry", async () => {
     await writeJson(env.STATE, STATE_KEYS.sourceStatus("kindle"), { state: "ok" } satisfies SourceStatus);
     const response = await request("/status", { headers: bearer });
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, SourceStatus>;
     expect(body.kindle.state).toBe("ok");
+  });
+
+  it("includes a registered source that has never run as null", async () => {
+    await env.STATE.delete(STATE_KEYS.sourceStatus("strava"));
+    const response = await request("/status", { headers: bearer });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, SourceStatus | null>;
+    expect("strava" in body).toBe(true);
+    expect(body.strava).toBeNull();
   });
 });
 

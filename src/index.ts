@@ -6,21 +6,29 @@ import { runSync } from "./sync";
 
 const STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize";
 
-function isAuthorized(request: Request, env: Env): boolean {
-  const url = new URL(request.url);
-  const token = request.headers.get("Authorization")?.replace(/^Bearer /, "") ?? url.searchParams.get("token");
+// Query-param auth is scoped to the Strava authorize route only (it's opened directly in a
+// browser, so it can't attach an Authorization header); every other route requires the header,
+// since query strings leak into access logs, proxy logs, and browser history.
+function isAuthorized(request: Request, env: Env, allowQueryToken: boolean): boolean {
+  const headerToken = request.headers.get("Authorization")?.replace(/^Bearer /, "");
+  const queryToken = allowQueryToken ? new URL(request.url).searchParams.get("token") : null;
+  const token = headerToken ?? queryToken;
   return Boolean(env.ADMIN_TOKEN) && token === env.ADMIN_TOKEN;
 }
 
 async function handleStatus(env: Env): Promise<Response> {
-  // List every stored status directly from KV rather than the current source registry,
-  // so status for a deferred or removed source (e.g. kindle) stays visible until cleared.
-  const prefix = STATE_KEYS.sourceStatus("");
   const statuses: Record<string, SourceStatus | null> = {};
-  const { keys } = await env.STATE.list({ prefix });
-  for (const key of keys) {
+  for (const source of SOURCES) {
+    statuses[source.name] = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
+  }
+  // Keys can outlive their source when an integration is removed from the registry; surface those too.
+  const prefix = STATE_KEYS.sourceStatus("");
+  const stored = await env.STATE.list({ prefix });
+  for (const key of stored.keys) {
     const sourceName = key.name.slice(prefix.length);
-    statuses[sourceName] = await readJson<SourceStatus>(env.STATE, key.name);
+    if (!(sourceName in statuses)) {
+      statuses[sourceName] = await readJson<SourceStatus>(env.STATE, key.name);
+    }
   }
   return Response.json(statuses);
 }
@@ -92,7 +100,7 @@ export default {
     if (route === "GET /strava/callback") {
       return handleStravaCallback(request, env);
     }
-    if (!isAuthorized(request, env)) {
+    if (!isAuthorized(request, env, route === "GET /strava/authorize")) {
       return Response.json({ error: "unauthorized" }, { status: 401 });
     }
     switch (route) {
