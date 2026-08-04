@@ -1,4 +1,4 @@
-import { HabitifyClient } from "./habitify";
+import { HabitifyClient, HabitInputValidationError } from "./habitify";
 import { readJson, STATE_KEYS, type SourceStatus } from "./state";
 import { INTEGRATIONS } from "./integrations/registry";
 import type { AuthMode, Env, IntegrationRoute, RouteContext } from "./integrations/types";
@@ -66,10 +66,53 @@ async function handleListHabits(context: RouteContext): Promise<Response> {
   }
 }
 
+// Lets an operator provision a Habitify habit to log into without ever handling
+// HABITIFY_API_KEY locally, symmetric with GET /habits above.
+async function handleCreateHabit(request: Request, context: RouteContext): Promise<Response> {
+  if (!context.env.HABITIFY_API_KEY) {
+    return Response.json({ error: "HABITIFY_API_KEY is not configured" }, { status: 503 });
+  }
+  let parsedBody: unknown;
+  try {
+    parsedBody = await request.json();
+  } catch {
+    return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+  }
+  if (typeof parsedBody !== "object" || parsedBody === null) {
+    return Response.json({ error: "Request body must be a JSON object" }, { status: 400 });
+  }
+  // Pick only the fields HabitifyClient.createHabit understands — anything else in the body
+  // (areaIds, timeOfDayIds, or unrecognized fields) is silently dropped rather than forwarded.
+  const { name, type, description, goal, occurrence } = parsedBody as Record<string, unknown>;
+  const habitify = new HabitifyClient(context.env.HABITIFY_API_KEY, context.fetchFn);
+  try {
+    const created = await habitify.createHabit({
+      name: name as string,
+      type: type as "good" | "bad" | undefined,
+      description: description as string | undefined,
+      goal: goal as { periodicity: "daily" | "weekly" | "monthly" | "yearly"; value: number; unit: string } | undefined,
+      occurrence,
+    });
+    return Response.json(created, { status: 201 });
+  } catch (error) {
+    // HabitInputValidationError is thrown synchronously by createHabit before any request is
+    // made (see assertValidCreateHabitInput in habitify.ts) — a 400, since the mistake is in the
+    // request body, not upstream. Anything else came from the Habitify call itself, a 502.
+    if (error instanceof HabitInputValidationError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    return Response.json(
+      { error: `Habitify request failed: ${error instanceof Error ? error.message : String(error)}` },
+      { status: 502 },
+    );
+  }
+}
+
 const CORE_ROUTES: IntegrationRoute[] = [
   { method: "POST", path: "/sync", auth: "admin", handler: handleSync },
   { method: "GET", path: "/status", auth: "admin", handler: (_request, context) => handleStatus(context.env) },
   { method: "GET", path: "/habits", auth: "admin", handler: (_request, context) => handleListHabits(context) },
+  { method: "POST", path: "/habits", auth: "admin", handler: handleCreateHabit },
 ];
 
 // Builds a lookup table keyed by "METHOD path" from a flat list of routes (core routes plus

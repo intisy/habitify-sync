@@ -112,6 +112,95 @@ describe("GET /habits", () => {
   });
 });
 
+describe("POST /habits", () => {
+  function postHabits(body: unknown, fetchFn: typeof fetch, env: Env = authedEnv): Promise<Response> {
+    return handleFetch(
+      new Request("https://worker.example/habits", {
+        method: "POST",
+        headers: { ...bearer, "Content-Type": "application/json" },
+        body: typeof body === "string" ? body : JSON.stringify(body),
+      }),
+      env,
+      fetchFn,
+    );
+  }
+
+  it("rejects requests without the admin token", async () => {
+    const response = await request("/habits", { method: "POST", body: JSON.stringify({ name: "Read" }) });
+    expect(response.status).toBe(401);
+  });
+
+  it("creates a habit and returns 201 with the created HabitSummary", async () => {
+    const fetchFn = (async () =>
+      Response.json(
+        {
+          id: "habit-new",
+          name: "Read 10 pages",
+          goals: [{ id: "goal-1", periodicity: "daily", value: 10, unit: "rep" }],
+        },
+        { status: 201 },
+      )) as typeof fetch;
+    const response = await postHabits(
+      { name: "Read 10 pages", goal: { periodicity: "daily", value: 10, unit: "rep" } },
+      fetchFn,
+    );
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as unknown;
+    expect(body).toEqual({ id: "habit-new", name: "Read 10 pages", unit: "rep" });
+  });
+
+  it("passes only name/type/description/goal/occurrence through, dropping unexpected fields", async () => {
+    let capturedBody: unknown;
+    const fetchFn = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedBody = JSON.parse(String(init?.body));
+      return Response.json({ id: "habit-new", name: "Read", goals: [] }, { status: 201 });
+    }) as typeof fetch;
+    await postHabits(
+      { name: "Read", areaIds: ["area-1"], timeOfDayIds: ["tod-1"], extra: "nope" },
+      fetchFn,
+    );
+    expect(capturedBody).toEqual({ name: "Read", type: "good", occurrence: { type: "daily" } });
+  });
+
+  it("returns 400 on malformed JSON", async () => {
+    const response = await postHabits("{not json", fetch);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toBeTruthy();
+  });
+
+  it("returns 400 on a client-side validation error, without calling fetch", async () => {
+    let called = false;
+    const fetchFn = (async () => {
+      called = true;
+      return Response.json({}, { status: 201 });
+    }) as typeof fetch;
+    const response = await postHabits({ name: "" }, fetchFn);
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("Habit name must be a non-empty string");
+    expect(called).toBe(false);
+  });
+
+  it("returns 503 with a clear error when HABITIFY_API_KEY is unset", async () => {
+    const envWithoutKey: Env = { ...authedEnv, HABITIFY_API_KEY: "" };
+    const response = await postHabits({ name: "Read" }, fetch, envWithoutKey);
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("HABITIFY_API_KEY is not configured");
+    expect(JSON.stringify(body)).not.toContain("habitify-key");
+  });
+
+  it("returns 502 with the upstream status/message when the Habitify call fails", async () => {
+    const fetchFn = (async () => new Response("nope", { status: 500 })) as typeof fetch;
+    const response = await postHabits({ name: "Read" }, fetchFn);
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("500");
+    expect(JSON.stringify(body)).not.toContain("habitify-key");
+  });
+});
+
 describe("scheduled", () => {
   it("runs the sync and writes source status to KV", async () => {
     await env.STATE.delete(STATE_KEYS.sourceStatus("strava"));

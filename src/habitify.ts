@@ -55,6 +55,78 @@ export interface HabitSummary {
   unit?: string;
 }
 
+const GOAL_PERIODICITIES = ["daily", "weekly", "monthly", "yearly"] as const;
+type GoalPeriodicity = (typeof GOAL_PERIODICITIES)[number];
+
+export interface CreateHabitGoal {
+  periodicity: GoalPeriodicity;
+  value: number;
+  unit: string;
+}
+
+export interface CreateHabitInput {
+  name: string;
+  type?: "good" | "bad";
+  description?: string;
+  goal?: CreateHabitGoal;
+  occurrence?: unknown;
+}
+
+// Trims a single raw habit object (as returned by either GET /habits or the 201 body of
+// POST /habits) down to { id, name, unit } — never the full raw object — so callers can't leak
+// unrelated personal habit data (schedules, streaks, notes, etc.) through the API. Returns
+// undefined for anything that isn't a usable habit object (i.e. lacks a string id).
+function parseHabitSummary(habit: unknown): HabitSummary | undefined {
+  if (typeof habit !== "object" || habit === null) return undefined;
+  const record = habit as Record<string, unknown>;
+  const id = record.id;
+  if (typeof id !== "string" || id.length === 0) return undefined;
+  const name = typeof record.name === "string" ? record.name : undefined;
+  const goals = Array.isArray(record.goals) ? record.goals : [];
+  const firstGoal = goals.length > 0 && typeof goals[0] === "object" && goals[0] !== null
+    ? (goals[0] as Record<string, unknown>)
+    : undefined;
+  const unit = typeof firstGoal?.unit === "string" ? firstGoal.unit : undefined;
+  return { id, name, unit };
+}
+
+// A distinct class (rather than a plain Error) lets callers like the POST /habits route
+// distinguish "the input itself was invalid" (400, caught before any request left the worker)
+// from "Habitify rejected or failed the request" (502) without resorting to string-matching on
+// the error message.
+export class HabitInputValidationError extends Error {}
+
+// Validated entirely before any network call: a 422 from Habitify names the offending field far
+// less clearly than a local check can, and there's no reason to spend a round trip discovering
+// a mistake this function can catch for free.
+function assertValidCreateHabitInput(input: CreateHabitInput): void {
+  if (typeof input.name !== "string" || input.name.trim().length === 0) {
+    throw new HabitInputValidationError("Habit name must be a non-empty string");
+  }
+  if (input.type !== undefined && input.type !== "good" && input.type !== "bad") {
+    throw new HabitInputValidationError(`Invalid habit type "${input.type}". Valid values are: good, bad`);
+  }
+  if (input.goal !== undefined) {
+    if (typeof input.goal !== "object" || input.goal === null) {
+      throw new HabitInputValidationError("Goal must be an object with periodicity, value, and unit");
+    }
+    const { periodicity, value, unit } = input.goal;
+    if (!(GOAL_PERIODICITIES as readonly string[]).includes(periodicity)) {
+      throw new HabitInputValidationError(
+        `Invalid goal periodicity "${periodicity}". Valid values are: ${GOAL_PERIODICITIES.join(", ")}`,
+      );
+    }
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new HabitInputValidationError(`Invalid goal value ${value}. Must be a finite number greater than 0`);
+    }
+    if (!isHabitifyUnitSymbol(unit)) {
+      throw new HabitInputValidationError(
+        `Invalid Habitify unitSymbol "${unit}". Valid values are: ${HABITIFY_UNIT_SYMBOLS.join(", ")}`,
+      );
+    }
+  }
+}
+
 export class HabitifyClient {
   constructor(
     private readonly apiKey: string,
@@ -101,19 +173,44 @@ export class HabitifyClient {
     const habits = Array.isArray(payload) ? payload : (payload as { data?: unknown[] })?.data ?? [];
     const summaries: HabitSummary[] = [];
     for (const habit of habits) {
-      if (typeof habit !== "object" || habit === null) continue;
-      const record = habit as Record<string, unknown>;
-      const id = record.id;
-      if (typeof id !== "string" || id.length === 0) continue;
-      const name = typeof record.name === "string" ? record.name : undefined;
-      const goals = Array.isArray(record.goals) ? record.goals : [];
-      const firstGoal = goals.length > 0 && typeof goals[0] === "object" && goals[0] !== null
-        ? (goals[0] as Record<string, unknown>)
-        : undefined;
-      const unit = typeof firstGoal?.unit === "string" ? firstGoal.unit : undefined;
-      summaries.push({ id, name, unit });
+      const summary = parseHabitSummary(habit);
+      if (summary) summaries.push(summary);
     }
     return summaries;
+  }
+
+  // Creates a new Habitify habit so an operator can provision one to log into without ever
+  // handling HABITIFY_API_KEY locally. Defaults mirror the simplest possible habit: a "good"
+  // habit that occurs every day. Optional fields are omitted from the request body entirely
+  // (rather than sent as null) since Habitify's schema treats their absence and null
+  // differently for some fields.
+  async createHabit(input: CreateHabitInput): Promise<HabitSummary> {
+    assertValidCreateHabitInput(input);
+    const body: Record<string, unknown> = {
+      name: input.name,
+      type: input.type ?? "good",
+      occurrence: input.occurrence ?? { type: "daily" },
+    };
+    if (input.description !== undefined) body.description = input.description;
+    if (input.goal !== undefined) body.goal = input.goal;
+
+    // Same detach-before-call reasoning as in request() and listHabits() above.
+    const performFetch = this.fetchFn;
+    const response = await performFetch(`${this.baseUrl}/habits`, {
+      method: "POST",
+      headers: { "X-API-Key": this.apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    // The success code for a creation is 201, not 200, so `response.ok` (2xx) is checked rather
+    // than an exact status code.
+    if (!response.ok) {
+      throw new Error(`Habitify POST /habits failed with status ${response.status}: ${await response.text()}`);
+    }
+    const created = parseHabitSummary(await response.json());
+    if (!created) {
+      throw new Error("Habitify POST /habits succeeded but returned an unusable habit object");
+    }
+    return created;
   }
 
   // Habitify v2 has no range-delete endpoint for logs (only per-log DELETE by id, and there's no
