@@ -70,15 +70,20 @@ describe("GET /habits", () => {
     const fetchFn = (async () =>
       Response.json({
         data: [
-          { id: "habit-1", name: "Read", unit_type: "pages", secret_internal_field: "should not leak" },
-          { id: "habit-2", name: "Run", unit: "min" },
+          {
+            id: "habit-1",
+            name: "Read",
+            goals: [{ id: "goal-1", createdAt: "2026-01-01T00:00:00Z", periodicity: "daily", value: 1, unit: "rep" }],
+            secret_internal_field: "should not leak",
+          },
+          { id: "habit-2", name: "Run", goals: [{ unit: "min" }] },
         ],
       })) as typeof fetch;
     const response = await handleFetch(new Request("https://worker.example/habits", { headers: bearer }), authedEnv, fetchFn);
     expect(response.status).toBe(200);
     const body = (await response.json()) as unknown[];
     expect(body).toEqual([
-      { id: "habit-1", name: "Read", unit: "pages" },
+      { id: "habit-1", name: "Read", unit: "rep" },
       { id: "habit-2", name: "Run", unit: "min" },
     ]);
     expect(JSON.stringify(body)).not.toContain("habitify-key");
