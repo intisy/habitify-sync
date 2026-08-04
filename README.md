@@ -56,12 +56,23 @@ the same hour with the same source data converges to the same result.
    otherwise.
 
 3. Find your Habitify habit ids and fill them into `wrangler.toml`
-   (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`):
+   (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`). Before the
+   first deploy, the only option is a direct call using your
+   `HABITIFY_API_KEY` locally:
 
    ```bash
    curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits
    ```
 
+   Once the worker is deployed (step 6) and `HABITIFY_API_KEY` is set as a
+   secret (step 5), you can instead let the worker look habit ids up for
+   you, so the key never has to leave Cloudflare or be handled locally:
+
+   ```bash
+   curl "https://<worker-url>/habits" -H "Authorization: Bearer $ADMIN_TOKEN"
+   ```
+
+   Either way, fill the resulting ids into `wrangler.toml` and redeploy.
    Make sure each habit's unit in Habitify matches what the worker logs:
    minutes for Strava and WakaTime, pages for Kindle. Leave `HABIT_ID_KINDLE`
    blank to leave that integration disabled — see its README for the
@@ -112,6 +123,7 @@ one-time setup steps (OAuth consent, callback domains, and the like):
 |---|---|---|
 | `POST /sync` (optional `?source=strava\|wakatime\|kindle`) | `admin` | Force a sync of all integrations, or just one |
 | `GET /status` | `admin` | Last run outcome per integration |
+| `GET /habits` | `admin` | List Habitify habit ids/names/units, for filling into `wrangler.toml` |
 | `GET /strava/authorize` | `admin-or-query-token` | Start the one-time Strava OAuth flow ([details](src/integrations/strava/README.md#routes)) |
 | `GET /strava/callback` | `public` | Finishes the Strava OAuth exchange ([details](src/integrations/strava/README.md#routes)) |
 | `PUT /kindle/session` | `admin` | Store the captured Kindle session ([details](src/integrations/kindle/README.md#routes)) |
