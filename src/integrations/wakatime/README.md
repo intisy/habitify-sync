@@ -10,7 +10,7 @@ habit configured by `HABIT_ID_WAKATIME`.
 | Key | Kind | Where to get it |
 |---|---|---|
 | `WAKATIME_API_KEY` | Secret | [wakatime.com/settings/api-key](https://wakatime.com/settings/api-key) |
-| `HABIT_ID_WAKATIME` | Var (`wrangler.toml`) | `curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits` |
+| `HABIT_ID_WAKATIME` | Var (`wrangler.toml`) | `curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits`, or `GET /habits` on the deployed worker |
 
 ## Setup
 
