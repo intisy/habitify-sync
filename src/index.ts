@@ -1,7 +1,3 @@
-import type { Env } from "./sources/types";
-
-export default {
-  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
-    console.log("Worker triggered", { env });
-  },
-};
+// Placeholder entry so the Vitest workers pool can resolve wrangler.toml's `main`.
+// Replaced by the real worker entry in a later change.
+export default {};
