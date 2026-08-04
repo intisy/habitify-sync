@@ -14,6 +14,10 @@ HABIT_ID_STRAVA = ""
 HABIT_ID_WAKATIME = ""
 HABIT_ID_KINDLE = ""
 KINDLE_POSITIONS_PER_PAGE = "1800"
+KINDLE_WORDS_PER_PAGE = "250"
+# JSON object mapping asin -> printed page count, e.g. {"B009ZUZ9FW":272,"B013UWFM52":304}.
+# Enables the exact print-pages derivation for those books; see src/integrations/kindle/README.md.
+KINDLE_PAGE_COUNTS = ""
 
 [[kv_namespaces]]
 binding = "STATE"

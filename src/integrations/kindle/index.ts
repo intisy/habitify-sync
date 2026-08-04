@@ -11,23 +11,32 @@ import {
 const GET_DEVICE_TOKEN_URL = "https://read.amazon.com/service/web/register/getDeviceToken";
 const LIBRARY_URL = "https://read.amazon.com/kindle-library/search";
 const START_READING_URL = "https://read.amazon.com/service/mobile/reader/startReading";
+const WORD_COUNT_URL = "https://read.amazon.com/renderer/wordCount";
 
 // The Kindle Cloud Reader's own device identity, verified live against a real account. It is a
 // constant for every account and every book — NOT a per-user value — so it is used as both the
 // serialNumber and deviceType query params and the user never captures or supplies one.
 const KINDLE_DEVICE_ID = "A2CTZ977SKFQZY";
 
-// One printed page of prose per Whispersync position unit, as a last-resort estimate for books
-// with no usable pageNumberUrl map (verified to be every book tested in practice — see README).
+// Last-resort estimate for a book whose Amazon word count is unavailable this sync (network
+// failure, unparseable response, or no contentVersion/karamelToken to call wordCount with at all).
 // Grounded in three verified books: Deep Work worked out to ~1500 positions/page, C Programming
 // Language to ~2070, and the dense, small-print ESV Bible to ~5600. 1800 splits the difference for
 // normal prose while accepting that dense reference books will over-count pages.
 const DEFAULT_POSITIONS_PER_PAGE = 1800;
 
+// Standard publishing-industry convention for words per printed page in a typical trade
+// paperback. Used only when a book has no entry in KINDLE_PAGE_COUNTS, i.e. no real printed page
+// count to divide the exact word count by.
+const DEFAULT_WORDS_PER_PAGE = 250;
+
 // This integration's own KV keys — not shared generic state.
 export const KINDLE_STATE_KEYS = {
   session: "kindle:session",
   positions: "kindle:positions",
+  // Keyed by asin AND contentVersion: a new revision (Amazon reflowing the book) is simply a
+  // different key, so the cache is invalidated by construction rather than by comparison.
+  totalWords: (asin: string, contentVersion: string) => `kindle:totalWords:${asin}:${contentVersion}`,
 };
 
 export interface KindleSession {
@@ -62,8 +71,13 @@ interface StartReadingResponse {
   // Verified null for a personal document, and also the shape for a book that's never been
   // opened (position -1). Both mean "nothing to track" for this book.
   lastPageReadData: { deviceName?: string; position: number; syncTime?: number } | null;
-  pageNumberUrl?: string;
   metadataUrl?: string;
+  // The revision to pass to wordCount, and the token to render it. contentVersion is a plain
+  // string when present. karamelToken's shape is only partly confirmed live — seen as a plain
+  // object with a `.token` string — so it's typed `unknown` and unwrapped defensively in
+  // extractRenderingToken rather than assumed.
+  contentVersion?: string;
+  karamelToken?: unknown;
 }
 
 interface BookMetadata {
@@ -73,9 +87,14 @@ interface BookMetadata {
 
 interface BookReading {
   position: number;
-  pageNumberUrl?: string;
   metadataUrl?: string;
+  contentVersion?: string;
+  renderingToken?: string;
 }
+
+// Which tier produced a book's page contribution this sync, most exact first. Carried into
+// diagnostics so GET /status shows, per book, whether its figure is exact or estimated.
+type PageDerivation = "print-pages" | "words-per-page" | "positions-fallback";
 
 // Diagnostic, per-book progress — carried on the returned HabitValue's `diagnostics` field purely
 // so GET /status is useful for a human to sanity-check; not used in any math here, and never sent
@@ -84,6 +103,9 @@ interface KindleBookDiagnostic {
   asin: string;
   title: string;
   progress: number;
+  wordsRead: number;
+  derivation: PageDerivation;
+  pages: number;
 }
 
 // Amazon's own JavaScript promotes the session-id cookie to this request header for the ADP-gated
@@ -159,52 +181,174 @@ async function fetchBookReading(
   if (!body.lastPageReadData || body.lastPageReadData.position < 0) {
     return null;
   }
-  return { position: body.lastPageReadData.position, pageNumberUrl: body.pageNumberUrl, metadataUrl: body.metadataUrl };
+  return {
+    position: body.lastPageReadData.position,
+    metadataUrl: body.metadataUrl,
+    contentVersion: typeof body.contentVersion === "string" ? body.contentVersion : undefined,
+    renderingToken: extractRenderingToken(body.karamelToken),
+  };
 }
 
-// pageNumberUrl's response schema was never observed live (absent on every book tested), so this
-// stays defensive: accept a bare array of positions (its index is the page number) or an object
-// wrapping such an array under "pageNumbers" or "positions", and treat anything else as unusable.
-function parsePageNumberMap(raw: unknown): number[] | null {
-  if (Array.isArray(raw) && raw.every((value) => typeof value === "number")) {
-    return raw as number[];
+// karamelToken's shape is only partly confirmed live: seen as a plain object with a `.token`
+// string field. Amazon's own clients are known to pass tokens as bare strings elsewhere, so both
+// shapes are accepted defensively rather than assuming the object form.
+function extractRenderingToken(karamelToken: unknown): string | undefined {
+  if (typeof karamelToken === "string" && karamelToken.length > 0) {
+    return karamelToken;
   }
-  if (raw && typeof raw === "object") {
-    const candidate = raw as Record<string, unknown>;
-    for (const key of ["pageNumbers", "positions"]) {
-      const value = candidate[key];
-      if (Array.isArray(value) && value.every((entry) => typeof entry === "number")) {
-        return value as number[];
-      }
+  if (karamelToken && typeof karamelToken === "object") {
+    const token = (karamelToken as Record<string, unknown>).token;
+    if (typeof token === "string" && token.length > 0) {
+      return token;
     }
   }
-  return null;
+  return undefined;
 }
 
-function pageFromPositionMap(map: number[], position: number): number | null {
-  if (map.length === 0) return null;
-  let page: number | null = null;
-  for (let index = 0; index < map.length; index++) {
-    if (map[index] <= position) {
-      page = index;
-    } else {
-      break;
-    }
+// Amazon's wordCount endpoint is range-based over the book's position units: startPosition is
+// required, endPosition optional. Omitting endPosition returns the count from startPosition
+// through the end of the book, so startPosition=0 with no endPosition is the whole book's word
+// count. Verified live against asin B009ZUZ9FW (revision e2e02ac4): wordCount(0, 238526) = 43090,
+// wordCount(238526) with no endPosition = 55560, and wordCount(0) with no endPosition = 98651 —
+// 43090 + 55560 = 98650 ≈ 98651, confirming the range semantics are additive and consistent.
+async function fetchWordCount(
+  asin: string,
+  revision: string,
+  startPosition: number,
+  endPosition: number | undefined,
+  cookie: string,
+  sessionId: string,
+  renderingToken: string,
+  fetchFn: typeof fetch,
+): Promise<number | null> {
+  const params = new URLSearchParams({
+    asin,
+    revision,
+    contentType: "FullBook",
+    startPosition: String(startPosition),
+  });
+  if (endPosition !== undefined) {
+    params.set("endPosition", String(endPosition));
   }
-  return page;
-}
-
-// pageNumberUrl is a presigned URL fetched without cookies, and is opportunistic/best-effort — it
-// was absent for every book verified live, so any failure here just falls back to the position
-// estimate rather than failing the book.
-async function fetchPageNumberMap(url: string, fetchFn: typeof fetch): Promise<number[] | null> {
   try {
-    const response = await fetchFn(url);
+    const response = await fetchFn(`${WORD_COUNT_URL}?${params.toString()}`, {
+      headers: { ...kindleHeaders(cookie, sessionId), "x-amz-rendering-token": renderingToken },
+    });
     if (!response.ok) return null;
-    return parsePageNumberMap(await response.json());
+    const body = (await response.json()) as { wordCount?: unknown };
+    return typeof body.wordCount === "number" ? body.wordCount : null;
   } catch {
     return null;
   }
+}
+
+// KINDLE_PAGE_COUNTS maps asin -> printed page count, letting the exact print-pages derivation
+// run for books the operator has configured. Parsed defensively: invalid JSON, a non-object body
+// (e.g. an array), or an individual entry that isn't a positive finite number is dropped —
+// per-entry for the bad-value case, entirely for a malformed top-level body — so a typo degrades
+// that book (or every book) to the words-per-page estimate rather than throwing.
+function parsePageCounts(raw: string | undefined): Record<string, number> {
+  if (!raw) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {};
+  }
+  const result: Record<string, number> = {};
+  for (const [asin, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      result[asin] = value;
+    }
+  }
+  return result;
+}
+
+// Fetches a book's whole-book word count (the exact denominator for the print-pages derivation),
+// cached in KV per asin+contentVersion so it's spent once per book, not once per sync.
+async function getTotalWordsInBook(
+  asin: string,
+  contentVersion: string,
+  renderingToken: string,
+  cookie: string,
+  sessionId: string,
+  kv: KVNamespace,
+  fetchFn: typeof fetch,
+): Promise<number | null> {
+  const key = KINDLE_STATE_KEYS.totalWords(asin, contentVersion);
+  const cached = await readJson<number>(kv, key);
+  if (cached !== null) return cached;
+
+  const total = await fetchWordCount(asin, contentVersion, 0, undefined, cookie, sessionId, renderingToken, fetchFn);
+  if (total !== null) {
+    await writeJson(kv, key, total);
+  }
+  return total;
+}
+
+interface PageDerivationResult {
+  pages: number;
+  wordsRead: number;
+  derivation: PageDerivation;
+}
+
+// The waterfall for one book's page contribution since its baseline, most exact first. Every tier
+// degrades to the next on any failure — a wordCount call failing (network error, non-2xx,
+// unparseable body) or a book missing contentVersion/karamelToken never fails the book, let alone
+// the whole sync; it just falls all the way back to the position estimate.
+async function derivePagesSinceBaseline(
+  asin: string,
+  baselinePosition: number,
+  currentPosition: number,
+  reading: BookReading,
+  printPageCount: number | undefined,
+  wordsPerPage: number,
+  positionsPerPage: number,
+  cookie: string,
+  sessionId: string,
+  kv: KVNamespace,
+  fetchFn: typeof fetch,
+): Promise<PageDerivationResult> {
+  const positionsFallback = (): PageDerivationResult => ({
+    pages: Math.max(0, (currentPosition - baselinePosition) / positionsPerPage),
+    wordsRead: 0,
+    derivation: "positions-fallback",
+  });
+
+  if (!reading.contentVersion || !reading.renderingToken) {
+    return positionsFallback();
+  }
+  // Bound to local consts so their non-undefined-ness survives the awaits below.
+  const contentVersion = reading.contentVersion;
+  const renderingToken = reading.renderingToken;
+
+  const wordsRead = await fetchWordCount(
+    asin,
+    contentVersion,
+    baselinePosition,
+    currentPosition,
+    cookie,
+    sessionId,
+    renderingToken,
+    fetchFn,
+  );
+  if (wordsRead === null) {
+    return positionsFallback();
+  }
+
+  if (printPageCount !== undefined) {
+    const totalWords = await getTotalWordsInBook(asin, contentVersion, renderingToken, cookie, sessionId, kv, fetchFn);
+    if (totalWords !== null && totalWords > 0) {
+      return { pages: (wordsRead / totalWords) * printPageCount, wordsRead, derivation: "print-pages" };
+    }
+    // totalWordsInBook unavailable (fetch failed, or degenerately 0) — fall through to the
+    // words-per-page estimate below, still using the wordsRead already fetched.
+  }
+
+  return { pages: wordsRead / wordsPerPage, wordsRead, derivation: "words-per-page" };
 }
 
 // metadataUrl returns JSONP — a bare function-call wrapper around the JSON body, e.g.
@@ -245,28 +389,6 @@ function progressFraction(position: number, metadata: BookMetadata): number | nu
   const span = metadata.endPosition - metadata.startPosition;
   if (span <= 0) return null;
   return Math.min(1, Math.max(0, (position - metadata.startPosition) / span));
-}
-
-// Converts a position delta since the book's baseline into a page-count delta. Prefers a real
-// printed-page lookup (pageFromPositionMap applied to both the baseline and current position, so
-// both ends go through the same map) when the book has a usable pageNumberUrl map; falls back to
-// the position/positionsPerPage estimate otherwise. Never negative — a book re-read from an
-// earlier position doesn't subtract from the day's total.
-function pagesSinceBaseline(
-  baselinePosition: number,
-  currentPosition: number,
-  pageNumberMap: number[] | null,
-  positionsPerPage: number,
-): { pages: number; estimated: boolean } {
-  if (pageNumberMap) {
-    const baselinePage = pageFromPositionMap(pageNumberMap, baselinePosition);
-    const currentPage = pageFromPositionMap(pageNumberMap, currentPosition);
-    if (baselinePage !== null && currentPage !== null) {
-      return { pages: Math.max(0, currentPage - baselinePage), estimated: false };
-    }
-  }
-  const positionDelta = currentPosition - baselinePosition;
-  return { pages: Math.max(0, positionDelta / positionsPerPage), estimated: true };
 }
 
 async function handlePutSession(request: Request, context: RouteContext): Promise<Response> {
@@ -316,12 +438,17 @@ export const kindleIntegration: Integration = {
     const deviceSessionToken = await fetchDeviceSessionToken(session.cookie, sessionId, fetchFn);
     const library = await fetchLibrary(session.cookie, sessionId, fetchFn);
     // Guarded against a nonsensical override (0, negative, or unparseable) producing a bogus,
-    // inflated page count.
+    // inflated (or negative) page count, for both the fallback divisor and the estimate divisor.
     const positionsPerPage = Math.max(1, Number(env.KINDLE_POSITIONS_PER_PAGE) || DEFAULT_POSITIONS_PER_PAGE);
+    const wordsPerPage = Math.max(1, Number(env.KINDLE_WORDS_PER_PAGE) || DEFAULT_WORDS_PER_PAGE);
+    const printPageCounts = parsePageCounts(env.KINDLE_PAGE_COUNTS);
 
-    const currentPositions: Record<string, number> = {};
-    const pageNumberMaps: Record<string, number[] | null> = {};
-    const bookDiagnostics: KindleBookDiagnostic[] = [];
+    interface ProcessedBook {
+      title: string;
+      reading: BookReading;
+      progress: number | null;
+    }
+    const processedBooks: Record<string, ProcessedBook> = {};
     let errorCount = 0;
     let lastBookError: Error | undefined;
 
@@ -331,20 +458,14 @@ export const kindleIntegration: Integration = {
         // A personal document, or a book never opened (position -1): nothing to track, silently.
         if (reading === null) continue;
 
-        currentPositions[item.asin] = reading.position;
-        pageNumberMaps[item.asin] = reading.pageNumberUrl
-          ? await fetchPageNumberMap(reading.pageNumberUrl, fetchFn)
-          : null;
-
+        let progress: number | null = null;
         if (reading.metadataUrl) {
           const metadata = await fetchMetadata(reading.metadataUrl, fetchFn);
-          const progress = metadata ? progressFraction(reading.position, metadata) : null;
-          // A null progress means the metadata span wasn't positive — omit the book rather than
-          // report a misleading 0%.
-          if (progress !== null) {
-            bookDiagnostics.push({ asin: item.asin, title: item.title, progress });
-          }
+          // A null progress means the metadata span wasn't positive — omit the book from
+          // diagnostics below rather than report a misleading 0%.
+          progress = metadata ? progressFraction(reading.position, metadata) : null;
         }
+        processedBooks[item.asin] = { title: item.title, reading, progress };
       } catch (error) {
         // A book failing individually doesn't fail the whole source — only the aggregate below
         // (every book failing) does.
@@ -365,20 +486,56 @@ export const kindleIntegration: Integration = {
 
     let total = 0;
     let anyEstimated = false;
-    for (const [asin, position] of Object.entries(currentPositions)) {
-      const pageNumberMap = pageNumberMaps[asin] ?? null;
+    const bookDiagnostics: KindleBookDiagnostic[] = [];
+
+    for (const [asin, book] of Object.entries(processedBooks)) {
+      const position = book.reading.position;
       const baselinePosition = mergedBaseline[asin];
+
+      let pages = 0;
+      let wordsRead = 0;
+      let derivation: PageDerivation = "positions-fallback";
+
       if (baselinePosition === undefined) {
         // First time seen this local day: record the baseline now so the NEXT sync measures
-        // progress from here, rather than from 0 forever. Contributes 0 to this sync's total, but
-        // still reports whether this book has a real page map available, for a truthful status.
+        // progress from here, rather than from 0 forever. Contributes 0 to this sync's total; no
+        // derivation was attempted, so it can't be claimed exact.
         mergedBaseline[asin] = position;
-        if (!pageNumberMap) anyEstimated = true;
-        continue;
+        anyEstimated = true;
+      } else if (position - baselinePosition <= 0) {
+        // Never negative — a book re-read from an earlier position doesn't subtract from the
+        // day's total — and not worth a wordCount call to prove what's already 0.
+        anyEstimated = true;
+      } else {
+        try {
+          const result = await derivePagesSinceBaseline(
+            asin,
+            baselinePosition,
+            position,
+            book.reading,
+            printPageCounts[asin],
+            wordsPerPage,
+            positionsPerPage,
+            session.cookie,
+            sessionId,
+            env.STATE,
+            fetchFn,
+          );
+          pages = result.pages;
+          wordsRead = result.wordsRead;
+          derivation = result.derivation;
+        } catch {
+          // Defense in depth: derivePagesSinceBaseline's own steps already degrade internally on
+          // failure, but an unexpected throw still must not fail the whole sync.
+          pages = Math.max(0, (position - baselinePosition) / positionsPerPage);
+        }
+        total += pages;
+        if (derivation !== "print-pages") anyEstimated = true;
       }
-      const { pages, estimated } = pagesSinceBaseline(baselinePosition, position, pageNumberMap, positionsPerPage);
-      total += pages;
-      if (estimated) anyEstimated = true;
+
+      if (book.progress !== null) {
+        bookDiagnostics.push({ asin, title: book.title, progress: book.progress, wordsRead, derivation, pages });
+      }
     }
 
     // Written on every sync (even when total is 0) so a mid-day first sighting's baseline is

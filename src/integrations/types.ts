@@ -10,6 +10,8 @@ export interface Env {
   STRAVA_CLIENT_SECRET?: string;
   WAKATIME_API_KEY?: string;
   KINDLE_POSITIONS_PER_PAGE?: string;
+  KINDLE_WORDS_PER_PAGE?: string;
+  KINDLE_PAGE_COUNTS?: string;
 }
 
 export interface HabitValue {
