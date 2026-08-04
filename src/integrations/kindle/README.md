@@ -14,15 +14,45 @@ Pages read today, as the `pages` unit, into the Habitify habit configured by
 *position* (not a derived page number) at the first sync of the current local
 day.
 
-The page count is almost always an **estimate**, derived from how far the
-position moved rather than from a real page map — see [Gotchas](#gotchas).
+Pages are derived from **Amazon's own word count** for each book (the
+`renderer/wordCount` endpoint), not from a positions-per-page guess. For each
+book whose position advanced past its baseline, the integration asks Amazon
+for the number of words read between the baseline and current position, then
+converts that to pages in one of two ways, in preference order:
+
+1. **Exact**, when you've configured that book's real printed page count in
+   `KINDLE_PAGE_COUNTS` — see [Configuration](#configuration). Pages are
+   `(wordsRead / totalWordsInBook) * printedPageCount`, both word counts
+   coming from Amazon.
+2. **Estimated**, otherwise — `wordsRead / KINDLE_WORDS_PER_PAGE` (default
+   `250`, the standard publishing-industry words-per-page convention).
+
+If Amazon's word count can't be fetched for a book (network failure, non-2xx,
+or the book is missing the `contentVersion`/`karamelToken` startReading
+provides), that book alone falls back to the old positions-per-page estimate
+— see [Gotchas](#gotchas). It never fails the sync.
 
 ## Configuration
 
 | Key | Kind | Where to get it |
 |---|---|---|
 | `HABIT_ID_KINDLE` | Var (`wrangler.toml`) | `curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits` |
-| `KINDLE_POSITIONS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — an estimate of Whispersync position units per printed page, default `1800`. See [Gotchas](#gotchas) for how that default was chosen. |
+| `KINDLE_WORDS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — words per printed page when no exact print length is configured, default `250` (a standard publishing convention). |
+| `KINDLE_PAGE_COUNTS` | Var (`wrangler.toml`), optional | A JSON object mapping asin to printed page count, e.g. `{"B009ZUZ9FW":272,"B013UWFM52":304}`. Find a book's printed page count on its Amazon product page, under the "Print length" line in the product details (only shown for books with a real print edition). Configuring a book here makes its page count *exact* instead of estimated. |
+| `KINDLE_POSITIONS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — an estimate of Whispersync position units per printed page, default `1800`. Only used as a last-resort fallback when a book's word count is unavailable. See [Gotchas](#gotchas) for how that default was chosen. |
+
+Example `wrangler.toml` snippet:
+
+```toml
+[vars]
+HABIT_ID_KINDLE = "abc123"
+KINDLE_WORDS_PER_PAGE = "250"
+KINDLE_PAGE_COUNTS = "{\"B009ZUZ9FW\":272,\"B013UWFM52\":304}"
+```
+
+Without any entries in `KINDLE_PAGE_COUNTS`, every book uses the
+words-per-page estimate — a good approximation, but not exact, since it
+doesn't account for a specific edition's actual typesetting.
 
 No secret is configured for this integration. Unlike Strava or WakaTime, its
 credential (an Amazon session cookie) is not known at deploy time and can
@@ -73,6 +103,7 @@ cached, so it isn't part of this capture.
 |---|---|
 | `kindle:session` | `{ cookie, updatedAt }` — the captured credential |
 | `kindle:positions` | `{ date, positions: { [asin]: number }, estimated }` — today's baseline Whispersync position per book |
+| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision, cached so it's fetched once per book per revision rather than every sync (only written for books with a `KINDLE_PAGE_COUNTS` entry) |
 
 To force a fresh baseline, delete `kindle:positions` directly:
 
@@ -85,18 +116,38 @@ or delete the key directly, then redo the [Setup](#setup) capture.
 
 ## Gotchas
 
-- **The value is an estimate.** Amazon exposes no real page map in practice —
-  every book tested returned no usable `pageNumberUrl` (it, along with
-  `fragmentMapUrl` and `manifestUrl`, was absent on every response). So pages
-  are derived from the Whispersync position delta since the day's baseline:
-  `pagesSinceBaseline = positionDelta / KINDLE_POSITIONS_PER_PAGE`. The
-  default, `1800`, is grounded in three verified books — Deep Work worked out
-  to roughly 1500 positions per printed page, The C Programming Language to
-  roughly 2070, and the dense, small-print ESV Bible to roughly 5600. `1800`
-  splits the difference for normal prose; dense reference books will
-  over-count pages. If a book *does* expose a usable `pageNumberUrl` map, it's
-  used instead for that book's delta, and that book's contribution is not
-  marked as an estimate — but treat this as opportunistic, not the norm.
+- **Pages are derived from Amazon's own word count, not a positions guess.**
+  For each book that advanced past its baseline, the integration calls
+  `GET https://read.amazon.com/renderer/wordCount?asin=…&revision=…
+  &contentType=FullBook&startPosition=…&endPosition=…` (the same cookie and
+  `x-amzn-sessionid`, plus an `x-amz-rendering-token` header) to get the exact
+  number of words read since the baseline. `revision` is `startReading`'s
+  `contentVersion`; the rendering token comes from `startReading`'s
+  `karamelToken`, which may be a bare string or `{ token: "…" }` — both are
+  handled. `startPosition` is required; omitting it is a 400. Omitting
+  `endPosition` returns the word count from `startPosition` through the end
+  of the book — so `startPosition=0` with no `endPosition` is the whole
+  book's word count, used as the denominator for the exact derivation below.
+- **Exact when you configure a print length, otherwise an estimate.** If the
+  book has an entry in `KINDLE_PAGE_COUNTS`, pages are
+  `(wordsRead / totalWordsInBook) * printedPageCount` — exact against the
+  real print edition, and not marked as an estimate. `totalWordsInBook` is
+  fetched once per book per revision and cached in KV (see
+  [Stored state](#stored-state)). Without a configured print length, pages
+  are `wordsRead / KINDLE_WORDS_PER_PAGE` (default `250`, the standard
+  publishing-industry convention) — a good approximation, not exact, since it
+  doesn't account for a specific edition's actual typesetting.
+- **The positions-per-page estimate is now only a last-resort fallback**,
+  used when a book's word count can't be fetched at all — no `contentVersion`
+  or usable rendering token, a non-2xx response, or an unparseable body. In
+  that case pages fall back to
+  `positionDelta / KINDLE_POSITIONS_PER_PAGE`, and that book's contribution is
+  marked as estimated. The default, `1800`, is grounded in three verified
+  books — Deep Work worked out to roughly 1500 positions per printed page,
+  The C Programming Language to roughly 2070, and the dense, small-print ESV
+  Bible to roughly 5600. `1800` splits the difference for normal prose;
+  dense reference books will over-count pages. A word-count failure degrades
+  only that book, never the whole sync.
 - **Amazon's own `percentageRead` is useless.** The library endpoint returns
   it as `0` for every book, even one 75% read — verified live. It is never
   read by this integration. Instead, each book's progress fraction is

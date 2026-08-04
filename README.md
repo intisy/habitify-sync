@@ -7,7 +7,7 @@ manually and checking status. It currently ships three integrations:
 
 - **[Strava](src/integrations/strava/README.md)** — activity minutes
 - **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes
-- **[Kindle](src/integrations/kindle/README.md)** — pages read, verified live against a real Amazon account (estimated, since Amazon exposes no real page map)
+- **[Kindle](src/integrations/kindle/README.md)** — pages read, derived from Amazon's own word-count endpoint (exact when a printed page count is configured, otherwise a words-per-page estimate)
 
 ## How it works
 

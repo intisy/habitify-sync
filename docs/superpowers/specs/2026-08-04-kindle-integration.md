@@ -1,6 +1,7 @@
 # Kindle integration — Design
 
-**Date:** 2026-08-04
+**Date:** 2026-08-04 (word-count mechanism added same day, after the initial
+Whispersync-position verification pass)
 **Status:** Verified live against a real Amazon account
 **Supersedes:** the earlier draft of this document, which predates
 verification and got several details wrong (see "What changed" below).
@@ -49,28 +50,89 @@ account, on the `kindle-verified` branch. The corrections:
 Habitify receives **pages read today**, unit `pages`, into `HABIT_ID_KINDLE`.
 
 Per book, the integration tracks its Whispersync *position* (not a derived
-page number) as the day's baseline. Pages read today = sum over books of
-`max(0, pagesSinceBaseline)`, where `pagesSinceBaseline` is derived from the
-position delta since the baseline, not from subtracting two independently
-rounded per-sync page numbers:
+page number) as the day's baseline. Only books whose position advanced past
+their baseline contribute, so finishing and reopening a book cannot subtract
+from the total, and a book that hasn't moved costs no extra requests (no
+`wordCount` call is made for it at all).
 
-1. **`pageNumberUrl` map** (opportunistic best-effort; absent on every book
-   verified so far) — when present and parseable, both the baseline and
-   current position are looked up in the same map, and the page-index
-   difference is used directly. Not marked as an estimate.
-2. **Position estimate** — `positionDelta / POSITIONS_PER_PAGE` (var,
-   default `1800`; grounded in three verified books, working out to roughly
-   1500, 2070, and 5600 positions per page respectively — prose vs. dense
-   reference material). This is the practical default for every book tested
-   so far, and is marked `estimated: true`.
+### Amazon exposes real word counts per position range
+
+Verified live against a real account:
+
+```
+GET https://read.amazon.com/renderer/wordCount
+    ?asin=<asin>
+    &revision=<contentVersion from startReading>
+    &contentType=FullBook
+    &startPosition=<int>
+    &endPosition=<int>        (optional)
+```
+
+Headers: the same cookie and `x-amzn-sessionid` as every other call, plus
+`x-amz-rendering-token: <karamelToken.token from startReading>`. Response:
+`{"wordCount": <integer>}`.
+
+`startPosition` is required — omitting it is a 400 naming `startPosition` in
+the validation error. Omitting `endPosition` returns the word count from
+`startPosition` through the end of the book, so `startPosition=0` with no
+`endPosition` is the whole book's word count.
+
+Measured for `B009ZUZ9FW` (contentVersion `e2e02ac4`, position `238526`):
+
+| Call | Result |
+|---|---|
+| `startPosition=0` (whole book) | 98651 |
+| `startPosition=238526`, no `endPosition` (words remaining) | 55560 |
+| `startPosition=0&endPosition=238526` (words in that range) | 43090 |
+
+`43090 + 55560 = 98650 ≈ 98651` — the range semantics are additive and
+consistent (off by one, likely a rounding or boundary-word artifact,
+immaterial to the metric).
+
+`startReading` supplies both inputs `wordCount` needs: `contentVersion` (used
+as `revision`) and `karamelToken`. `karamelToken`'s shape is only partly
+confirmed — observed as a plain object with a `.token` string field — so it's
+handled defensively as either that shape or a bare string, never assumed.
+
+### Preference order, most exact first
+
+For each book whose position advanced past its baseline, `wordsRead =
+wordCount(startPosition=baseline, endPosition=current)`. That integer feeds
+one of three tiers, in order:
+
+1. **`print-pages` (exact)** — when the book has an entry in
+   `KINDLE_PAGE_COUNTS` (asin → printed page count, operator-supplied):
+   `pages = (wordsRead / totalWordsInBook) * printedPageCount`, where
+   `totalWordsInBook = wordCount(startPosition=0)` (whole book), cached in KV
+   per asin+contentVersion so it's fetched once per book per revision, not
+   every sync. Not marked as an estimate.
+2. **`words-per-page` (estimated)** — otherwise: `pages = wordsRead /
+   KINDLE_WORDS_PER_PAGE` (var, default `250`, the standard
+   publishing-industry words-per-page convention).
+3. **`positions-fallback` (estimated, last resort)** — when `wordCount`
+   itself fails for that book (non-2xx, unparseable body, or no
+   `contentVersion`/usable `karamelToken` to call it with):
+   `positionDelta / KINDLE_POSITIONS_PER_PAGE`, the original mechanism from
+   the first verification pass (default `1800`, see "What changed" above).
+   A `wordCount` failure degrades only that book, never the whole sync.
+
+Per-book page contributions are summed as floats across every book, and
+rounded once at the end — not rounded per book, which would compound error
+across books with fractional per-book contributions.
+
+**No book in the account exposed `pageNumberUrl`** (nor `fragmentMapUrl` or
+`manifestUrl`) during either verification pass, so the printed-page-map tier
+from the original draft was dead in practice; it's been replaced outright by
+the `KINDLE_PAGE_COUNTS`-driven exact tier above, which requires an
+operator-supplied page count instead of an Amazon-supplied map.
 
 A book's own progress fraction — `(position - startPosition) / (endPosition -
 startPosition)`, clamped to `[0, 1]` — is computed separately from
 `metadataUrl` purely for `GET /status` diagnostics; it has no part in the
-pages metric.
-
-Only books whose position advanced past their baseline contribute, so
-finishing and reopening a book cannot subtract from the total.
+pages metric. Diagnostics per book now also include `wordsRead`, `derivation`
+(`"print-pages"` | `"words-per-page"` | `"positions-fallback"`), and `pages`
+contributed. The top-level `estimated` flag stays `true` unless every counted
+book this sync used `print-pages`.
 
 ## Credentials and state
 
@@ -81,6 +143,7 @@ without a redeploy:
 |---|---|
 | `kindle:session` | `{ cookie, updatedAt }` |
 | `kindle:positions` | `{ date, positions: { [asin]: number }, estimated: boolean }` |
+| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision. Keyed by asin AND contentVersion, so a new revision is simply a different key rather than something to compare and invalidate. Written only for books with a `KINDLE_PAGE_COUNTS` entry. |
 
 `kindle:session` holds only the Amazon `Cookie` header string — no device
 identifiers, since the device pair is now a hardcoded constant
@@ -116,18 +179,22 @@ seam, so no generic file changes.
    `getDeviceToken` just succeeded.
 4. For each book, `GET /service/mobile/reader/startReading?asin=…&clientVersion=20000100`
    with the cookie, `x-amzn-sessionid`, and `x-adp-session-token` →
-   `lastPageReadData` (position) plus, opportunistically, `pageNumberUrl` and
-   `metadataUrl`. `lastPageReadData: null` or `position: -1` → skip silently.
-   A book that fails outright (non-2xx or thrown error) is skipped, not
-   fatal, unless every book in the library fails.
+   `lastPageReadData` (position), `contentVersion`, `karamelToken`, and
+   opportunistically `metadataUrl`. `lastPageReadData: null` or `position: -1`
+   → skip silently. A book that fails outright (non-2xx or thrown error) is
+   skipped, not fatal, unless every book in the library fails.
 5. Merge this sync's positions into the day's baseline: a book with no
    existing baseline (new day, or first sighting today) records its current
    position as its own baseline and contributes 0; an existing baseline is
    never advanced except by writing the merged result back at the end.
-6. For books with an existing baseline, derive `pagesSinceBaseline` per the
-   rules above and sum them.
-7. Write back `kindle:positions` (every sync, so a fresh mid-day baseline
-   persists) and return the summed pages.
+6. For each book with an existing baseline whose position advanced past it
+   (delta > 0 — otherwise skipped, no request spent): call `wordCount` with
+   `startPosition=baseline&endPosition=current` for `wordsRead`, then derive
+   that book's pages per the preference order above (`print-pages` →
+   `words-per-page` → `positions-fallback`), summing every book's
+   contribution as a float.
+7. Round the summed total once. Write back `kindle:positions` (every sync,
+   so a fresh mid-day baseline persists) and return the rounded pages.
 
 ## Failure modes
 
@@ -153,10 +220,19 @@ seam, so no generic file changes.
 - `startReading` returns 200 with the documented field set, including
   `lastPageReadData` (or `null` for a personal document).
 - `pageNumberUrl`, `fragmentMapUrl`, and `manifestUrl` were absent on every
-  book tested.
+  book tested — in practice, printed-page maps are unavailable through
+  Amazon's own API, which is why the exact tier is now driven by an
+  operator-supplied `KINDLE_PAGE_COUNTS` instead.
 - `metadataUrl` returns JSONP wrapping `startPosition`/`endPosition`,
   confirmed against three books.
 - `percentageRead` is always `0`, regardless of actual progress.
+- `renderer/wordCount` (asin `B009ZUZ9FW`, contentVersion `e2e02ac4`):
+  `startPosition=0` → 98651 (whole book); `startPosition=238526`, no
+  `endPosition` → 55560 (words remaining); `startPosition=0&endPosition=238526`
+  → 43090 (words in that range). `43090 + 55560 = 98650 ≈ 98651`, confirming
+  the range semantics. Omitting `startPosition` → 400 naming `startPosition`.
+- `startReading` supplies `contentVersion` and `karamelToken` alongside
+  `lastPageReadData`; `karamelToken` was observed as `{ token: "…" }`.
 
 **Not yet verified:**
 
@@ -168,9 +244,13 @@ seam, so no generic file changes.
   test of that variable.
 - Long-term cookie lifetime and how often `session-id` actually needs
   re-capture in practice — only observed over a short verification window.
-- Whether any book in a larger library ever does expose `pageNumberUrl`; the
-  opportunistic tier remains implemented but unexercised against a real
-  positive case.
+- Whether `karamelToken` is ever supplied as a bare string rather than
+  `{ token: "…" }` — only the object shape has been observed live; the bare
+  string is handled defensively but unexercised against a real positive case.
+- `wordCount`'s behavior for a book with no `contentVersion` at all (e.g. a
+  personal document, which is already excluded upstream by
+  `lastPageReadData: null`) — not directly exercised, since no such case
+  reaches this code path in practice.
 
 ## Out of scope
 
