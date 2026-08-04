@@ -23,6 +23,7 @@ export function timeZoneOffsetMinutes(timeZone: string, at: Date): number {
     part("year"),
     part("month") - 1,
     part("day"),
+    // Intl emits "24" (not "00") for midnight when hour12 is false, so it must be wrapped back to 0.
     part("hour") % 24,
     part("minute"),
     part("second"),
