@@ -1,6 +1,6 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import worker, { buildRouteTable, dispatch } from "../src/index";
+import worker, { buildRouteTable, dispatch, handleFetch } from "../src/index";
 import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "../src/state";
 import type { Env, IntegrationRoute } from "../src/integrations/types";
 
@@ -58,6 +58,52 @@ describe("GET /status", () => {
     const body = (await response.json()) as Record<string, SourceStatus | null>;
     expect("strava" in body).toBe(true);
     expect(body.strava).toBeNull();
+  });
+});
+
+describe("GET /habits", () => {
+  it("rejects requests without the admin token", async () => {
+    expect((await request("/habits")).status).toBe(401);
+  });
+
+  it("returns a trimmed habit list using the injected fetchFn", async () => {
+    const fetchFn = (async () =>
+      Response.json({
+        data: [
+          { id: "habit-1", name: "Read", unit_type: "pages", secret_internal_field: "should not leak" },
+          { id: "habit-2", name: "Run", unit: "min" },
+        ],
+      })) as typeof fetch;
+    const response = await handleFetch(new Request("https://worker.example/habits", { headers: bearer }), authedEnv, fetchFn);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as unknown[];
+    expect(body).toEqual([
+      { id: "habit-1", name: "Read", unit: "pages" },
+      { id: "habit-2", name: "Run", unit: "min" },
+    ]);
+    expect(JSON.stringify(body)).not.toContain("habitify-key");
+  });
+
+  it("returns 503 with a clear error when HABITIFY_API_KEY is unset", async () => {
+    const envWithoutKey: Env = { ...authedEnv, HABITIFY_API_KEY: "" };
+    const response = await handleFetch(
+      new Request("https://worker.example/habits", { headers: bearer }),
+      envWithoutKey,
+      fetch,
+    );
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("HABITIFY_API_KEY is not configured");
+    expect(JSON.stringify(body)).not.toContain("habitify-key");
+  });
+
+  it("returns 502 with the upstream status/message when the Habitify call fails", async () => {
+    const fetchFn = (async () => new Response("nope", { status: 500 })) as typeof fetch;
+    const response = await handleFetch(new Request("https://worker.example/habits", { headers: bearer }), authedEnv, fetchFn);
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("500");
+    expect(JSON.stringify(body)).not.toContain("habitify-key");
   });
 });
 

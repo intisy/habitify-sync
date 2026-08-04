@@ -1,3 +1,4 @@
+import { HabitifyClient } from "./habitify";
 import { readJson, STATE_KEYS, type SourceStatus } from "./state";
 import { INTEGRATIONS } from "./integrations/registry";
 import type { AuthMode, Env, IntegrationRoute, RouteContext } from "./integrations/types";
@@ -45,9 +46,30 @@ async function handleSync(request: Request, context: RouteContext): Promise<Resp
   return Response.json(await runSync(context.env, INTEGRATIONS, new Date(), context.fetchFn, sourceParam));
 }
 
+// Lets an operator discover Habitify habit ids without ever handling HABITIFY_API_KEY locally —
+// the worker already holds the secret, so it can look habits up on the operator's behalf.
+async function handleListHabits(context: RouteContext): Promise<Response> {
+  if (!context.env.HABITIFY_API_KEY) {
+    return Response.json({ error: "HABITIFY_API_KEY is not configured" }, { status: 503 });
+  }
+  const habitify = new HabitifyClient(context.env.HABITIFY_API_KEY, context.fetchFn);
+  try {
+    const habits = await habitify.listHabits();
+    return Response.json(habits);
+  } catch (error) {
+    // The thrown error's message already omits the API key (see HabitifyClient.listHabits), so
+    // it's safe to surface directly here.
+    return Response.json(
+      { error: `Habitify request failed: ${error instanceof Error ? error.message : String(error)}` },
+      { status: 502 },
+    );
+  }
+}
+
 const CORE_ROUTES: IntegrationRoute[] = [
   { method: "POST", path: "/sync", auth: "admin", handler: handleSync },
   { method: "GET", path: "/status", auth: "admin", handler: (_request, context) => handleStatus(context.env) },
+  { method: "GET", path: "/habits", auth: "admin", handler: (_request, context) => handleListHabits(context) },
 ];
 
 // Builds a lookup table keyed by "METHOD path" from a flat list of routes (core routes plus
