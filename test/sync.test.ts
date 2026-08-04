@@ -67,7 +67,11 @@ describe("runSync", () => {
     expect(results[0].status.lastSuccessAt).toBe("2026-08-03T10:00:00.000Z");
   });
 
-  it("reports disabled sources without calling them", async () => {
+  it("reports disabled sources without calling them, preserving the previous lastSuccessAt", async () => {
+    await writeJson(env.STATE, STATE_KEYS.sourceStatus("off"), {
+      state: "ok",
+      lastSuccessAt: "2026-08-03T10:00:00.000Z",
+    } satisfies SourceStatus);
     const disabled: Source = {
       name: "off",
       enabled: () => false,
@@ -77,8 +81,10 @@ describe("runSync", () => {
     };
     const results = await runSync(testEnv, [disabled], now, habitifyFetchRecorder([]));
     expect(results[0].status.state).toBe("disabled");
+    expect(results[0].status.lastSuccessAt).toBe("2026-08-03T10:00:00.000Z");
     const stored = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus("off"));
     expect(stored?.state).toBe("disabled");
+    expect(stored?.lastSuccessAt).toBe("2026-08-03T10:00:00.000Z");
   });
 
   it("filters to a single source when onlySource is given", async () => {

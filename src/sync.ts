@@ -43,14 +43,15 @@ export async function runSync(
 
   for (const source of sources) {
     if (onlySource && source.name !== onlySource) continue;
+    const previous = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
     if (!source.enabled(env)) {
-      const disabledStatus: SourceStatus = { state: "disabled" };
+      // Carry lastSuccessAt forward so unsetting a secret doesn't erase when the source last worked.
+      const disabledStatus: SourceStatus = { state: "disabled", lastSuccessAt: previous?.lastSuccessAt };
       await writeJson(env.STATE, STATE_KEYS.sourceStatus(source.name), disabledStatus);
       results.push({ source: source.name, status: disabledStatus });
       continue;
     }
 
-    const previous = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
     let status: SourceStatus;
     try {
       const values = await source.fetchToday(context);
