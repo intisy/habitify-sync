@@ -12,6 +12,8 @@ enabled = true
 TIMEZONE = "Europe/Berlin"
 HABIT_ID_STRAVA = ""
 HABIT_ID_WAKATIME = ""
+HABIT_ID_KINDLE = ""
+KINDLE_POSITIONS_PER_PAGE = "1400"
 
 [[kv_namespaces]]
 binding = "STATE"
