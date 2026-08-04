@@ -20,6 +20,10 @@ function recordingFetch(recorded: RecordedRequest[], status = 200): typeof fetch
   }) as typeof fetch;
 }
 
+function jsonFetch(body: unknown, status = 200): typeof fetch {
+  return (async () => new Response(JSON.stringify(body), { status })) as typeof fetch;
+}
+
 describe("HabitifyClient.upsertTodayLog", () => {
   const now = new Date("2026-08-04T10:00:00Z");
 
@@ -48,5 +52,82 @@ describe("HabitifyClient.upsertTodayLog", () => {
     await expect(
       client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now),
     ).rejects.toThrow("Habitify DELETE");
+  });
+});
+
+describe("HabitifyClient.listHabits", () => {
+  it("sends the correct URL and the raw-key Authorization header", async () => {
+    const recorded: RecordedRequest[] = [];
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      recorded.push({
+        method: init?.method ?? "GET",
+        url: String(input),
+        body: init?.body === undefined ? undefined : String(init.body),
+        authorization: new Headers(init?.headers).get("Authorization"),
+      });
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    }) as typeof fetch;
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example");
+    await client.listHabits();
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].method).toBe("GET");
+    expect(recorded[0].url).toBe("https://habitify.example/habits");
+    expect(recorded[0].authorization).toBe("api-key");
+  });
+
+  it("parses a { data: [...] } response into trimmed summaries", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({ data: [{ id: "habit-1", name: "Read", unit_type: "pages", extra: "ignored" }] }),
+      "https://habitify.example",
+    );
+    const habits = await client.listHabits();
+    expect(habits).toEqual([{ id: "habit-1", name: "Read", unit: "pages" }]);
+  });
+
+  it("tolerates a bare array response", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch([{ id: "habit-2", name: "Run", unit: "min" }]),
+      "https://habitify.example",
+    );
+    const habits = await client.listHabits();
+    expect(habits).toEqual([{ id: "habit-2", name: "Run", unit: "min" }]);
+  });
+
+  it("skips entries with no id", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({ data: [{ name: "No id" }, { id: "habit-3", name: "Has id" }] }),
+      "https://habitify.example",
+    );
+    const habits = await client.listHabits();
+    expect(habits).toEqual([{ id: "habit-3", name: "Has id", unit: undefined }]);
+  });
+
+  it("prefers unit_type over unit when both are present", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({ data: [{ id: "habit-4", unit_type: "pages", unit: "min" }] }),
+      "https://habitify.example",
+    );
+    const habits = await client.listHabits();
+    expect(habits[0].unit).toBe("pages");
+  });
+
+  it("falls back to unit when unit_type is absent", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({ data: [{ id: "habit-5", unit: "min" }] }),
+      "https://habitify.example",
+    );
+    const habits = await client.listHabits();
+    expect(habits[0].unit).toBe("min");
+  });
+
+  it("throws on a non-ok response", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example");
+    await expect(client.listHabits()).rejects.toThrow("Habitify GET /habits failed with status 401");
   });
 });

@@ -3,6 +3,12 @@ import { isoDayRange } from "./time";
 
 const HABITIFY_BASE_URL = "https://api.habitify.me";
 
+export interface HabitSummary {
+  id: string;
+  name?: string;
+  unit?: string;
+}
+
 export class HabitifyClient {
   constructor(
     private readonly apiKey: string,
@@ -19,6 +25,35 @@ export class HabitifyClient {
     if (!response.ok) {
       throw new Error(`Habitify ${method} ${path} failed with status ${response.status}: ${await response.text()}`);
     }
+  }
+
+  // Returns only id/name/unit for each habit — never the full raw habit object — so this
+  // discovery route can't leak unrelated personal habit data (schedules, streaks, notes, etc.)
+  // through the API. The exact shape of Habitify's list response is only partly confirmed from
+  // their docs, so this parsing is deliberately defensive: it accepts either `{ data: [...] }`
+  // or a bare array, and tolerates either `unit_type` (the field the existing upsert writes) or
+  // `unit` for the unit, skipping any entry that lacks an id.
+  async listHabits(): Promise<HabitSummary[]> {
+    const response = await this.fetchFn(`${this.baseUrl}/habits`, {
+      method: "GET",
+      headers: { Authorization: this.apiKey },
+    });
+    if (!response.ok) {
+      throw new Error(`Habitify GET /habits failed with status ${response.status}: ${await response.text()}`);
+    }
+    const payload = (await response.json()) as unknown;
+    const habits = Array.isArray(payload) ? payload : (payload as { data?: unknown[] })?.data ?? [];
+    const summaries: HabitSummary[] = [];
+    for (const habit of habits) {
+      if (typeof habit !== "object" || habit === null) continue;
+      const record = habit as Record<string, unknown>;
+      const id = record.id;
+      if (typeof id !== "string" || id.length === 0) continue;
+      const name = typeof record.name === "string" ? record.name : undefined;
+      const unit = typeof record.unit_type === "string" ? record.unit_type : typeof record.unit === "string" ? record.unit : undefined;
+      summaries.push({ id, name, unit });
+    }
+    return summaries;
   }
 
   // Habitify appends logs, so an idempotent write is delete-today-then-post.
