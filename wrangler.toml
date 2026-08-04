@@ -12,7 +12,7 @@ enabled = true
 TIMEZONE = "Europe/Berlin"
 HABIT_ID_STRAVA = ""
 HABIT_ID_WAKATIME = ""
-HABIT_ID_KINDLE = ""
+HABIT_ID_KINDLE = "-OzDyt5aM7WxM_lxepUc"
 KINDLE_POSITIONS_PER_PAGE = "1800"
 KINDLE_WORDS_PER_PAGE = "250"
 # OPTIONAL OVERRIDE, not the primary mechanism: printed page counts are discovered automatically
