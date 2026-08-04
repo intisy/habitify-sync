@@ -111,7 +111,9 @@ seam, so no generic file changes.
    with the cookie and `x-amzn-sessionid` → `deviceSessionToken`. A 4xx, or a
    200 with no usable token field, means `AuthNeededError`.
 3. `GET /kindle-library/search?query=&libraryType=BOOKS&sortType=recency&querySize=50`
-   with the same headers → the book list.
+   with the same headers → the book list. A 401/403 here means `AuthNeededError`
+   too — the cookie can still be rejected at this step even though
+   `getDeviceToken` just succeeded.
 4. For each book, `GET /service/mobile/reader/startReading?asin=…&clientVersion=20000100`
    with the cookie, `x-amzn-sessionid`, and `x-adp-session-token` →
    `lastPageReadData` (position) plus, opportunistically, `pageNumberUrl` and
@@ -134,6 +136,7 @@ seam, so no generic file changes.
 | No session captured | `auth_needed` |
 | Cookie lacks `session-id` | `auth_needed` |
 | `getDeviceToken` rejects the cookie, or returns no usable token | `auth_needed` |
+| Library search (`/kindle-library/search`) rejects the cookie with 401/403 — the cookie can go stale between the two calls even though `getDeviceToken` just succeeded | `auth_needed` |
 | A personal document, or a never-opened book | skipped silently — not an error, not counted |
 | One book's `startReading` fails | that book is skipped; the sync still succeeds |
 | Every book's `startReading` fails | `error`, naming the last failure |

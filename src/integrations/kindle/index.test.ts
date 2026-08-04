@@ -2,8 +2,20 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeEach, describe, expect, it } from "vitest";
 import worker, { handleFetch } from "../../index";
 import { readJson, writeJson } from "../../state";
-import { AuthNeededError, type Env, type SourceContext } from "../types";
+import { AuthNeededError, type Env, type HabitValue, type SourceContext } from "../types";
 import { KINDLE_STATE_KEYS, kindleIntegration, type KindlePositions, type KindleSession } from "./index";
+
+// Kindle's own diagnostics shape, nested under HabitValue.diagnostics — never sent to Habitify,
+// only surfaced via GET /status. Extracting it needs one narrow cast from `unknown` (diagnostics
+// is intentionally a loosely-typed bag), not the whole-object cast this used to require.
+interface KindleDiagnostics {
+  estimated: boolean;
+  books: { asin: string; title: string; progress: number }[];
+}
+
+function diagnosticsOf(value: HabitValue): KindleDiagnostics | undefined {
+  return value.diagnostics as KindleDiagnostics | undefined;
+}
 
 const DEVICE_TOKEN_URL = "https://read.amazon.com/service/web/register/getDeviceToken";
 const LIBRARY_URL = "https://read.amazon.com/kindle-library/search";
@@ -98,7 +110,7 @@ describe("kindleIntegration.fetchToday - auth", () => {
     await expect(kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
   });
 
-  it("sends x-amzn-sessionid on getDeviceToken and both x-amzn-sessionid and x-adp-session-token on startReading", async () => {
+  it("sends x-amzn-sessionid on getDeviceToken, library search, and startReading, plus x-adp-session-token on startReading", async () => {
     await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
     const seenHeaders: { url: string; headers: Headers }[] = [];
     const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -115,9 +127,23 @@ describe("kindleIntegration.fetchToday - auth", () => {
     const deviceTokenCall = seenHeaders.find((call) => call.url.startsWith(DEVICE_TOKEN_URL))!;
     expect(deviceTokenCall.headers.get("x-amzn-sessionid")).toBe(DUMMY_SESSION_ID);
 
+    const libraryCall = seenHeaders.find((call) => call.url.startsWith(LIBRARY_URL))!;
+    expect(libraryCall.headers.get("x-amzn-sessionid")).toBe(DUMMY_SESSION_ID);
+
     const startReadingCall = seenHeaders.find((call) => call.url.startsWith(START_READING_URL))!;
     expect(startReadingCall.headers.get("x-amzn-sessionid")).toBe(DUMMY_SESSION_ID);
     expect(startReadingCall.headers.get("x-adp-session-token")).toBe("a".repeat(1481));
+  });
+
+  it("throws AuthNeededError when the library search returns 401", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return new Response("unauthorized", { status: 401 });
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+    await expect(kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
   });
 
   it("uses the constant device id as both serialNumber and deviceType, with no per-user capture", async () => {
@@ -252,19 +278,43 @@ describe("kindleIntegration.fetchToday - metadata JSONP and progress fraction", 
     }) as typeof fetch;
 
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    const [value] = values as unknown as { books: { asin: string; progress: number }[] }[];
-    expect(value.books).toHaveLength(1);
-    expect(value.books[0].progress).toBeCloseTo(0.018, 2);
+    const books = diagnosticsOf(values[0])?.books;
+    expect(books).toHaveLength(1);
+    expect(books?.[0].progress).toBeCloseTo(0.018, 2);
   });
 
   it("computes the progress fraction correctly for the three verified books", async () => {
     const fetchFn = fetchForBooks([DEEP_WORK, C_PROGRAMMING_LANGUAGE, ESV_BIBLE]);
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    const [value] = values as unknown as { books: { asin: string; progress: number }[] }[];
-    const byAsin = Object.fromEntries(value.books.map((book) => [book.asin, book.progress]));
+    const books = diagnosticsOf(values[0])?.books ?? [];
+    const byAsin = Object.fromEntries(books.map((book) => [book.asin, book.progress]));
     expect(byAsin[DEEP_WORK.asin]).toBeCloseTo(0.018, 2);
     expect(byAsin[C_PROGRAMMING_LANGUAGE.asin]).toBeCloseTo(0.42, 2);
     expect(byAsin[ESV_BIBLE.asin]).toBeCloseTo(0.75, 2);
+  });
+
+  it("omits a book from diagnostics when the metadata span is not positive", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse(["ASIN1"]);
+      if (url.startsWith(START_READING_URL)) {
+        return Response.json({
+          lastPageReadData: { position: 100 },
+          metadataUrl: "https://cdn.example.com/metadata/degenerate",
+        });
+      }
+      if (url === "https://cdn.example.com/metadata/degenerate") {
+        // endPosition <= startPosition: a degenerate span that would otherwise report a
+        // misleading 0% rather than being omitted.
+        return new Response(jsonp({ startPosition: 100, endPosition: 100 }));
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(diagnosticsOf(values[0])?.books).toEqual([]);
   });
 });
 
@@ -305,7 +355,8 @@ describe("kindleIntegration.fetchToday - page delta math and baseline lifecycle"
 
     const fetchFn = fetchForPositions({ ASIN1: 1000 + 3600 }); // delta 3600, default 1800/page => 2 pages
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
-    expect(values).toEqual([expect.objectContaining({ value: 2, estimated: true })]);
+    expect(values).toEqual([expect.objectContaining({ value: 2 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
   });
 
   it("honors KINDLE_POSITIONS_PER_PAGE when overridden", async () => {
@@ -319,7 +370,42 @@ describe("kindleIntegration.fetchToday - page delta math and baseline lifecycle"
     const values = await kindleIntegration.fetchToday(
       makeContext(kindleEnv({ KINDLE_POSITIONS_PER_PAGE: "900" }), fetchFn),
     );
-    expect(values).toEqual([expect.objectContaining({ value: 4, estimated: true })]);
+    expect(values).toEqual([expect.objectContaining({ value: 4 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
+  });
+
+  it("guards a negative KINDLE_POSITIONS_PER_PAGE override up to a minimum of 1", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN1: 1000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    // "0" would fall back to the default via `Number(...) || DEFAULT`, since 0 is falsy — this
+    // wouldn't exercise the guard. A negative value is truthy, so it survives that fallback and
+    // must be caught by Math.max(1, ...) instead, or it would produce a nonsensical inflated
+    // (or, for an exact divisor, negative) page count.
+    const fetchFn = fetchForPositions({ ASIN1: 1000 + 3600 });
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_POSITIONS_PER_PAGE: "-100" }), fetchFn),
+    );
+    // Guarded to 1 position/page, so this is 3600 pages, not a negative or otherwise bogus number.
+    expect(values).toEqual([expect.objectContaining({ value: 3600 })]);
+  });
+
+  it("sums fractional per-book estimates before rounding once at the end", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN_A: 1000, ASIN_B: 2000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    // Each book advances by 900 positions — half of the default 1800/page — so each contributes
+    // exactly 0.5 pages. Rounding each book independently (0.5 -> 1) would wrongly total 2; summing
+    // the floats first and rounding once yields 1.
+    const fetchFn = fetchForPositions({ ASIN_A: 1900, ASIN_B: 2900 });
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ value: 1 })]);
   });
 
   it("does not establish a new baseline for a different day than local 'today'", async () => {
@@ -410,7 +496,8 @@ describe("kindleIntegration.fetchToday - pageNumberUrl preferred when usable", (
 
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
     // page(4600) - page(1000) = 4 - 1 = 3, and this path is not an estimate.
-    expect(values).toEqual([expect.objectContaining({ value: 3, estimated: false })]);
+    expect(values).toEqual([expect.objectContaining({ value: 3 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(false);
   });
 
   it("falls back to the position estimate when the pageNumberUrl map is unparseable", async () => {
@@ -436,7 +523,8 @@ describe("kindleIntegration.fetchToday - pageNumberUrl preferred when usable", (
 
     const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
     // (4600-1000)/1800 = 2, estimated.
-    expect(values).toEqual([expect.objectContaining({ value: 2, estimated: true })]);
+    expect(values).toEqual([expect.objectContaining({ value: 2 })]);
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
   });
 });
 
