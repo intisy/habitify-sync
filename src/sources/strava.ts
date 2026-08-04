@@ -2,7 +2,7 @@ import { readJson, STATE_KEYS, writeJson, type StravaTokens } from "../state";
 import { localMidnightEpochSeconds } from "../time";
 import { AuthNeededError, type Env, type HabitValue, type Source, type SourceContext } from "./types";
 
-export const STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token";
+export const STRAVA_TOKEN_URL = "https://www.strava.com/api/v3/oauth/token";
 const STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities";
 
 interface StravaTokenResponse {
@@ -11,17 +11,32 @@ interface StravaTokenResponse {
   expires_at: number;
 }
 
+function mapTokenResponse(body: StravaTokenResponse): StravaTokens {
+  return {
+    accessToken: body.access_token,
+    refreshToken: body.refresh_token,
+    expiresAt: body.expires_at,
+  };
+}
+
+// Strava documents (and OAuth 2.0 requires) form-urlencoded token requests; URLSearchParams
+// sets the Content-Type header itself, so it must not be set manually here.
+function requestStravaToken(env: Env, fetchFn: typeof fetch, grantParams: Record<string, string>): Promise<Response> {
+  return fetchFn(STRAVA_TOKEN_URL, {
+    method: "POST",
+    body: new URLSearchParams({
+      client_id: env.STRAVA_CLIENT_ID ?? "",
+      client_secret: env.STRAVA_CLIENT_SECRET ?? "",
+      ...grantParams,
+    }),
+  });
+}
+
 // Strava rotates refresh tokens on every refresh, so the new one must be persisted.
 async function refreshTokens(env: Env, fetchFn: typeof fetch, tokens: StravaTokens): Promise<StravaTokens> {
-  const response = await fetchFn(STRAVA_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: env.STRAVA_CLIENT_ID,
-      client_secret: env.STRAVA_CLIENT_SECRET,
-      grant_type: "refresh_token",
-      refresh_token: tokens.refreshToken,
-    }),
+  const response = await requestStravaToken(env, fetchFn, {
+    grant_type: "refresh_token",
+    refresh_token: tokens.refreshToken,
   });
   if (response.status === 400 || response.status === 401) {
     throw new AuthNeededError("Strava refused the refresh token; re-run /strava/authorize");
@@ -29,14 +44,21 @@ async function refreshTokens(env: Env, fetchFn: typeof fetch, tokens: StravaToke
   if (!response.ok) {
     throw new Error(`Strava token refresh failed with status ${response.status}`);
   }
-  const body = (await response.json()) as StravaTokenResponse;
-  const refreshed: StravaTokens = {
-    accessToken: body.access_token,
-    refreshToken: body.refresh_token,
-    expiresAt: body.expires_at,
-  };
+  const refreshed = mapTokenResponse((await response.json()) as StravaTokenResponse);
   await writeJson(env.STATE, STATE_KEYS.stravaTokens, refreshed);
   return refreshed;
+}
+
+// Performs the one-time authorization_code exchange after the user completes Strava's consent
+// screen, and persists the resulting tokens the same way refreshTokens does.
+export async function exchangeStravaCode(env: Env, fetchFn: typeof fetch, code: string): Promise<StravaTokens> {
+  const response = await requestStravaToken(env, fetchFn, { grant_type: "authorization_code", code });
+  if (!response.ok) {
+    throw new Error(`Strava code exchange failed with status ${response.status}`);
+  }
+  const tokens = mapTokenResponse((await response.json()) as StravaTokenResponse);
+  await writeJson(env.STATE, STATE_KEYS.stravaTokens, tokens);
+  return tokens;
 }
 
 export const stravaSource: Source = {

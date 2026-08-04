@@ -1,7 +1,7 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import worker from "../src/index";
-import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus } from "../src/state";
+import worker, { handleFetch } from "../src/index";
+import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus, type StravaTokens } from "../src/state";
 import type { Env } from "../src/sources/types";
 
 const authedEnv: Env = { ...env, ADMIN_TOKEN: "secret-token", HABITIFY_API_KEY: "habitify-key" };
@@ -98,5 +98,21 @@ describe("GET /strava/callback", () => {
     await env.STATE.put(STATE_KEYS.stravaOauthState, "expected-state");
     const response = await request("/strava/callback?code=abc&state=wrong-state");
     expect(response.status).toBe(403);
+  });
+
+  it("exchanges the code for tokens and stores them in KV", async () => {
+    await env.STATE.put(STATE_KEYS.stravaOauthState, "expected-state");
+    const fakeFetch = (async () =>
+      Response.json({ access_token: "access-1", refresh_token: "refresh-1", expires_at: 9999999999 })) as typeof fetch;
+
+    const response = await handleFetch(
+      new Request("https://worker.example/strava/callback?code=abc123&state=expected-state"),
+      authedEnv,
+      fakeFetch,
+    );
+
+    expect(response.status).toBe(200);
+    const stored = await readJson<StravaTokens>(env.STATE, STATE_KEYS.stravaTokens);
+    expect(stored).toEqual({ accessToken: "access-1", refreshToken: "refresh-1", expiresAt: 9999999999 });
   });
 });

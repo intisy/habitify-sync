@@ -38,7 +38,7 @@ describe("stravaSource", () => {
     const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       requests.push({ url, body: init?.body === undefined ? undefined : String(init.body) });
-      if (url === "https://www.strava.com/oauth/token") {
+      if (url === "https://www.strava.com/api/v3/oauth/token") {
         return Response.json({ access_token: "new-access", refresh_token: "new-refresh", expires_at: 9999999999 });
       }
       expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer new-access");
@@ -47,7 +47,11 @@ describe("stravaSource", () => {
 
     const values = await stravaSource.fetchToday(makeContext(stravaEnv(), fetchFn));
 
-    expect(JSON.parse(requests[0].body!)).toMatchObject({ grant_type: "refresh_token", refresh_token: "old-refresh" });
+    const refreshParams = new URLSearchParams(requests[0].body!);
+    expect(refreshParams.get("grant_type")).toBe("refresh_token");
+    expect(refreshParams.get("refresh_token")).toBe("old-refresh");
+    expect(refreshParams.get("client_id")).toBe("client-id");
+    expect(refreshParams.get("client_secret")).toBe("client-secret");
     expect(requests[1].url).toBe(
       `https://www.strava.com/api/v3/athlete/activities?after=${berlinMidnightEpoch}&per_page=100`,
     );
@@ -61,7 +65,7 @@ describe("stravaSource", () => {
     const expired: StravaTokens = { accessToken: "old-access", refreshToken: "revoked-refresh", expiresAt: 1000 };
     await writeJson(env.STATE, STATE_KEYS.stravaTokens, expired);
     const fetchFn = (async (input: RequestInfo | URL) => {
-      expect(String(input)).toBe("https://www.strava.com/oauth/token");
+      expect(String(input)).toBe("https://www.strava.com/api/v3/oauth/token");
       return new Response("bad request", { status: 400 });
     }) as typeof fetch;
     await expect(stravaSource.fetchToday(makeContext(stravaEnv(), fetchFn))).rejects.toThrow(AuthNeededError);

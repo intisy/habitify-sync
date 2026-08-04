@@ -1,6 +1,6 @@
-import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus, type StravaTokens } from "./state";
+import { readJson, STATE_KEYS, writeJson, type AmazonCookies, type SourceStatus } from "./state";
 import { SOURCES } from "./sources/registry";
-import { STRAVA_TOKEN_URL } from "./sources/strava";
+import { exchangeStravaCode } from "./sources/strava";
 import type { Env } from "./sources/types";
 import { runSync } from "./sync";
 
@@ -58,7 +58,7 @@ async function handleStravaAuthorize(request: Request, env: Env): Promise<Respon
   return Response.redirect(redirect.toString(), 302);
 }
 
-async function handleStravaCallback(request: Request, env: Env): Promise<Response> {
+async function handleStravaCallback(request: Request, env: Env, fetchFn: typeof fetch): Promise<Response> {
   const url = new URL(request.url);
   const expectedState = await env.STATE.get(STATE_KEYS.stravaOauthState);
   if (!expectedState || url.searchParams.get("state") !== expectedState) {
@@ -68,53 +68,44 @@ async function handleStravaCallback(request: Request, env: Env): Promise<Respons
   if (!code) {
     return Response.json({ error: "missing code parameter" }, { status: 400 });
   }
-  const response = await fetch(STRAVA_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: env.STRAVA_CLIENT_ID,
-      client_secret: env.STRAVA_CLIENT_SECRET,
-      grant_type: "authorization_code",
-      code,
-    }),
-  });
-  if (!response.ok) {
-    return Response.json({ error: `Strava code exchange failed with status ${response.status}` }, { status: 502 });
+  try {
+    await exchangeStravaCode(env, fetchFn, code);
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 502 });
   }
-  const body = (await response.json()) as { access_token: string; refresh_token: string; expires_at: number };
-  const tokens: StravaTokens = {
-    accessToken: body.access_token,
-    refreshToken: body.refresh_token,
-    expiresAt: body.expires_at,
-  };
-  await writeJson(env.STATE, STATE_KEYS.stravaTokens, tokens);
   await env.STATE.delete(STATE_KEYS.stravaOauthState);
   return new Response("Strava connected. You can close this tab.", { status: 200 });
 }
 
+// Takes an injectable fetchFn (defaulted to the global fetch) so tests can exercise the Strava
+// code exchange and /sync route without hitting the network.
+export async function handleFetch(request: Request, env: Env, fetchFn: typeof fetch = fetch): Promise<Response> {
+  const url = new URL(request.url);
+  const route = `${request.method} ${url.pathname}`;
+
+  if (route === "GET /strava/callback") {
+    return handleStravaCallback(request, env, fetchFn);
+  }
+  if (!isAuthorized(request, env, route === "GET /strava/authorize")) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  switch (route) {
+    case "POST /sync":
+      return Response.json(await runSync(env, SOURCES, new Date(), fetchFn, url.searchParams.get("source") ?? undefined));
+    case "GET /status":
+      return handleStatus(env);
+    case "PUT /state/amazon-cookies":
+      return handleAmazonCookies(request, env);
+    case "GET /strava/authorize":
+      return handleStravaAuthorize(request, env);
+    default:
+      return Response.json({ error: "not found" }, { status: 404 });
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, _context: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const route = `${request.method} ${url.pathname}`;
-
-    if (route === "GET /strava/callback") {
-      return handleStravaCallback(request, env);
-    }
-    if (!isAuthorized(request, env, route === "GET /strava/authorize")) {
-      return Response.json({ error: "unauthorized" }, { status: 401 });
-    }
-    switch (route) {
-      case "POST /sync":
-        return Response.json(await runSync(env, SOURCES, new Date(), fetch, url.searchParams.get("source") ?? undefined));
-      case "GET /status":
-        return handleStatus(env);
-      case "PUT /state/amazon-cookies":
-        return handleAmazonCookies(request, env);
-      case "GET /strava/authorize":
-        return handleStravaAuthorize(request, env);
-      default:
-        return Response.json({ error: "not found" }, { status: 404 });
-    }
+    return handleFetch(request, env);
   },
 
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext): Promise<void> {
