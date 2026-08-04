@@ -57,6 +57,16 @@ describe("stravaSource", () => {
     expect(stored?.refreshToken).toBe("new-refresh");
   });
 
+  it("throws AuthNeededError when the token refresh is rejected", async () => {
+    const expired: StravaTokens = { accessToken: "old-access", refreshToken: "revoked-refresh", expiresAt: 1000 };
+    await writeJson(env.STATE, STATE_KEYS.stravaTokens, expired);
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("https://www.strava.com/oauth/token");
+      return new Response("bad request", { status: 400 });
+    }) as typeof fetch;
+    await expect(stravaSource.fetchToday(makeContext(stravaEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
+  });
+
   it("throws AuthNeededError when the activities call returns 401", async () => {
     const valid: StravaTokens = { accessToken: "access", refreshToken: "refresh", expiresAt: 9999999999 };
     await writeJson(env.STATE, STATE_KEYS.stravaTokens, valid);
