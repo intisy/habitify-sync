@@ -14,7 +14,11 @@ export async function runSync(
   env: Env,
   sources: Integration[],
   now: Date,
-  fetchFn: typeof fetch = fetch,
+  // Bound to globalThis as a defensive invariant: every call site here (and inside
+  // HabitifyClient, see habitify.ts) already treats fetchFn as a plain function, but a pre-bound
+  // function keeps working correctly even if that invariant is ever broken by future code that
+  // calls it as `something.fetchFn(...)` instead.
+  fetchFn: typeof fetch = fetch.bind(globalThis),
   onlySource?: string,
 ): Promise<SyncResult[]> {
   const timeZone = env.TIMEZONE || DEFAULT_TIME_ZONE;

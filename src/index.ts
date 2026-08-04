@@ -116,8 +116,16 @@ const ROUTE_TABLE = buildRouteTable([
 ]);
 
 // Takes an injectable fetchFn (defaulted to the global fetch) so tests can exercise the Strava
-// code exchange and /sync route without hitting the network.
-export async function handleFetch(request: Request, env: Env, fetchFn: typeof fetch = fetch): Promise<Response> {
+// code exchange and /sync route without hitting the network. Bound to globalThis so the default
+// keeps working as a defensive invariant: every call site here treats fetchFn as a plain
+// function, and HabitifyClient already detaches it before calling it (see habitify.ts), but a
+// pre-bound function tolerates being called as `something.fetchFn(...)` too, in case that
+// invariant is ever broken by future code touching this default.
+export async function handleFetch(
+  request: Request,
+  env: Env,
+  fetchFn: typeof fetch = fetch.bind(globalThis),
+): Promise<Response> {
   return dispatch(ROUTE_TABLE, request, env, fetchFn);
 }
 

@@ -17,7 +17,12 @@ export class HabitifyClient {
   ) {}
 
   private async request(method: string, path: string, body?: unknown): Promise<void> {
-    const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+    // Detach fetchFn from `this` before calling it. workerd's native fetch throws "Illegal
+    // invocation" if called with a `this` that isn't the global scope, and `this.fetchFn(...)`
+    // does exactly that — the property access makes `this` (the HabitifyClient instance) the
+    // receiver of the call.
+    const performFetch = this.fetchFn;
+    const response = await performFetch(`${this.baseUrl}${path}`, {
       method,
       headers: { Authorization: this.apiKey, "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -34,7 +39,10 @@ export class HabitifyClient {
   // or a bare array, and tolerates either `unit_type` (the field the existing upsert writes) or
   // `unit` for the unit, skipping any entry that lacks an id.
   async listHabits(): Promise<HabitSummary[]> {
-    const response = await this.fetchFn(`${this.baseUrl}/habits`, {
+    // Same detach-before-call reasoning as in request() above: calling this.fetchFn(...) directly
+    // would pass the HabitifyClient instance as `this` to the native fetch, which workerd rejects.
+    const performFetch = this.fetchFn;
+    const response = await performFetch(`${this.baseUrl}/habits`, {
       method: "GET",
       headers: { Authorization: this.apiKey },
     });
