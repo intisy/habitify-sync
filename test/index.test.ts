@@ -347,6 +347,45 @@ describe("scheduled", () => {
   });
 });
 
+describe("Cache-Control: no-store", () => {
+  it("is present on a 200 response", async () => {
+    const response = await request("/status", { headers: bearer });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    // The body is still intact JSON with the right Content-Type — copying the response to add
+    // the header must not have disturbed either.
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    const body = (await response.json()) as unknown;
+    expect(body).toEqual(await (await request("/status", { headers: bearer })).json());
+  });
+
+  it("is present on the 401", async () => {
+    const response = await request("/status");
+    expect(response.status).toBe(401);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("is present on the 404", async () => {
+    const response = await request("/nope", { headers: bearer });
+    expect(response.status).toBe(404);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("is present on the Strava authorize 302, without breaking the redirect", async () => {
+    const stravaEnv: Env = { ...authedEnv, STRAVA_CLIENT_ID: "client-id", STRAVA_CLIENT_SECRET: "client-secret" };
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      new Request("https://worker.example/strava/authorize?token=secret-token"),
+      stravaEnv,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(response.status).toBe(302);
+    expect(response.headers.get("Location")).toContain("https://www.strava.com/oauth/authorize");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+});
+
 describe("dispatch (generic route table)", () => {
   it("throws naming the conflicting route when two routes register the same method and path", () => {
     const routeA: IntegrationRoute = { method: "GET", path: "/dup", auth: "admin", handler: async () => new Response("a") };

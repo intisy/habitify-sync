@@ -165,6 +165,26 @@ export function buildRouteTable(routes: IntegrationRoute[]): Map<string, Integra
   return table;
 }
 
+// Cloudflare's edge cache keys on the full URL including the query string, so a stale response
+// cached for one query string (e.g. a 404 cached before a deployment finished propagating) can
+// keep being served while requests with a different query string see the real, current result.
+// Every route here either reports live state (status, habits, journal) or performs an action
+// (sync, habit creation, the Strava OAuth handshake), so none of it is safe to cache at any
+// layer — this stamps every response dispatch returns with Cache-Control: no-store, regardless
+// of which branch below produced it.
+function withNoStore(response: Response): Response {
+  // Response.headers can be immutable depending on how the response was constructed (e.g.
+  // Response.redirect()), so build a fresh Response around the original's body/status/headers
+  // rather than mutating the response we were handed.
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", "no-store");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 export async function dispatch(
   routeTable: Map<string, IntegrationRoute>,
   request: Request,
@@ -174,18 +194,18 @@ export async function dispatch(
   const url = new URL(request.url);
   const route = routeTable.get(`${request.method} ${url.pathname}`);
   if (route?.auth === "public") {
-    return route.handler(request, { env, fetchFn });
+    return withNoStore(await route.handler(request, { env, fetchFn }));
   }
   // A route that isn't registered is treated as requiring the strictest auth (bearer token
   // only, no query fallback), so probing for routes without a token gets the same 401 a real
   // admin route would, rather than a bare 404 leaking which paths exist.
   if (!isAuthorized(request, env, route?.auth ?? "admin")) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
+    return withNoStore(Response.json({ error: "unauthorized" }, { status: 401 }));
   }
   if (!route) {
-    return Response.json({ error: "not found" }, { status: 404 });
+    return withNoStore(Response.json({ error: "not found" }, { status: 404 }));
   }
-  return route.handler(request, { env, fetchFn });
+  return withNoStore(await route.handler(request, { env, fetchFn }));
 }
 
 const ROUTE_TABLE = buildRouteTable([
