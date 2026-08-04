@@ -9,7 +9,7 @@
 A single TypeScript Cloudflare Worker that syncs daily metrics from external
 services into Habitify habits:
 
-- **Kindle** — pages read today
+- **Kindle** — pages read today (**not implemented**, see below)
 - **Strava** — minutes of activity published today
 - **WakaTime** — minutes coded today
 
@@ -20,7 +20,7 @@ one registry entry, its secrets.
 
 | Decision | Choice |
 |---|---|
-| Kindle data source | Unofficial Amazon API (read.amazon.com reading insights, session cookies) |
+| Kindle data source | Not implemented — no page-count endpoint reachable with session cookies (see below) |
 | Logged values | Real quantities (pages, minutes), not check-ins |
 | Trigger | Hourly Cloudflare cron + authenticated manual HTTP endpoint |
 | Architecture | Single Worker, connector interface, KV for mutable state |
@@ -33,12 +33,12 @@ src/
   index.ts          worker entry: scheduled (hourly cron) + fetch (HTTP API)
   sync.ts           orchestrator: run all sources, isolate failures, record status
   habitify.ts       Habitify API client (upsert today's log per habit)
-  state.ts          KV access (tokens, cookies, sync status)
+  state.ts          KV access (tokens, sync status)
   sources/
     types.ts        the Source interface — the extension point
     strava.ts
     wakatime.ts
-    kindle.ts
+    # kindle.ts — not implemented, see "Kindle — Not implemented" below
 ```
 
 ### Extension point
@@ -84,15 +84,29 @@ registry entry + its secrets/vars. Documented as a recipe in the README.
 - Data: `GET /api/v1/users/current/summaries?start=today&end=today`; value =
   grand total minutes.
 
-### Kindle
+### Kindle — Not implemented
 
-- Amazon session cookies stored in KV; rotated anytime via
-  `PUT /state/amazon-cookies` — no redeploy when they expire.
-- Data: the read.amazon.com reading-insights JSON endpoint behind the session
-  cookies. The exact endpoint and response shape are captured via browser
-  DevTools during implementation; value = pages read today.
-- Expired/invalid cookies → the source reports `auth_needed` in its status
-  record instead of failing the run.
+Amazon exposes no page-count data reachable with a session cookie for this
+account. Empirical probe results:
+
+- `www.amazon.com/kindle/reading/insights/data?locale=en_US` works with
+  session cookies but returns only streaks (`current_daily_streak` with
+  start/end) and completed-title dates — no pages, no minutes.
+- `read.amazon.com/kindle-library/search?libraryType=BOOKS` works and returns
+  `percentageRead`, but it is `0` for every book on this account.
+- `read.amazon.com/service/mobile/reader/startReading` — the only endpoint
+  carrying `lastPageReadData.position` and a page-number map — returns 403
+  "The given request is not an ADP session request".
+- `read.amazon.com/service/web/register/getDeviceToken` returns 403
+  "Insufficient or invalid information to authenticate the session".
+- Only `libraryType=BOOKS` is accepted (other values 400), so personal
+  documents — where the reading actually happens — are unreachable.
+
+Conclusion: a page-count source would require a device token captured from
+the Kindle mobile/desktop app, and even then `percentageRead` is 0 here. The
+`Source` seam keeps Kindle a later addition; no Kindle code exists in the
+repo (the `PUT /state/amazon-cookies` route and `HABIT_ID_KINDLE` var were
+removed after this was confirmed).
 
 ## HTTP API
 
@@ -102,22 +116,21 @@ OAuth callback.
 | Route | Purpose |
 |---|---|
 | `POST /sync` (optional `?source=`) | Force a sync of all or one source |
-| `GET /status` | Last run/result per source, cookie freshness |
-| `PUT /state/amazon-cookies` | Rotate Amazon session cookies |
+| `GET /status` | Last run/result per source |
 | `GET /strava/authorize` | Start one-time Strava OAuth |
 | `GET /strava/callback` | Finish OAuth, seed refresh token into KV (validated by state param, not bearer) |
 
 ## Config & secrets
 
-- Non-secret vars in `wrangler.toml`: `HABIT_ID_KINDLE`, `HABIT_ID_STRAVA`,
-  `HABIT_ID_WAKATIME`, `TIMEZONE` (default `Europe/Berlin`; defines "today" for
-  all sources and for Habitify target dates).
+- Non-secret vars in `wrangler.toml`: `HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`,
+  `TIMEZONE` (default `Europe/Berlin`; defines "today" for all sources and for
+  Habitify target dates).
 - Secrets: `HABITIFY_API_KEY`, `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`,
   `WAKATIME_API_KEY`, `ADMIN_TOKEN`.
 - Local development uses `.dev.vars` (gitignored); production uses
   `wrangler secret put`. A committed `.dev.vars.example` documents every key.
-- One KV namespace (`STATE`) for all mutable state: Strava tokens, Amazon
-  cookies, per-source sync status.
+- One KV namespace (`STATE`) for all mutable state: Strava tokens, per-source
+  sync status.
 - A source is `enabled` exactly when its required secrets/vars are present, so
   the public repo works with any subset of integrations configured.
 

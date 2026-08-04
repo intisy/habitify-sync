@@ -1,0 +1,5 @@
+HABITIFY_API_KEY=your-habitify-api-key
+STRAVA_CLIENT_ID=12345
+STRAVA_CLIENT_SECRET=your-strava-client-secret
+WAKATIME_API_KEY=waka_00000000-0000-0000-0000-000000000000
+ADMIN_TOKEN=choose-a-long-random-string

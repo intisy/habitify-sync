@@ -1,5 +1,7 @@
 # habitify-sync Implementation Plan
 
+*This is a historical planning artifact and does not reflect the final implementation — Kindle and the Amazon-cookies route were dropped (see the design doc's ["Kindle — Not implemented"](../specs/2026-08-04-habitify-sync-design.md#kindle--not-implemented) section); see the [README](../../../README.md) for current behavior.*
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A Cloudflare Worker that syncs Kindle pages read, Strava activity minutes, and WakaTime coding minutes into Habitify habits hourly, with a connector interface that makes new integrations one-file additions.
