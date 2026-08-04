@@ -1,7 +1,8 @@
 # Kindle integration — Design
 
 **Date:** 2026-08-04 (word-count mechanism added same day, after the initial
-Whispersync-position verification pass)
+Whispersync-position verification pass; dynamic page-count discovery added
+same day again, after live-verifying the product-page endpoint)
 **Status:** Verified live against a real Amazon account
 **Supersedes:** the earlier draft of this document, which predates
 verification and got several details wrong (see "What changed" below).
@@ -44,6 +45,13 @@ account, on the `kindle-verified` branch. The corrections:
   track" case.
 - **Stored session state dropped the device pair.** `kindle:session` is now
   `{ cookie, updatedAt }` only.
+- **Printed page counts are now discovered automatically, not hand-configured.**
+  The exact `print-pages` tier's printed-page-count input used to require an
+  operator to maintain `KINDLE_PAGE_COUNTS` (asin → page count) by hand for
+  every book. Verified live: the printed page count is present, unauthenticated,
+  on the book's own public Amazon product page — see "Amazon exposes printed
+  page counts on the public product page" below. `KINDLE_PAGE_COUNTS` is kept,
+  but demoted to an optional override for when that discovery fails.
 
 ## Metric definition
 
@@ -94,27 +102,73 @@ as `revision`) and `karamelToken`. `karamelToken`'s shape is only partly
 confirmed — observed as a plain object with a `.token` string field — so it's
 handled defensively as either that shape or a bare string, never assumed.
 
+### Amazon exposes printed page counts on the public product page
+
+Verified live with a plain `curl` — no authentication, no cookies:
+
+```
+GET https://www.amazon.com/dp/<asin>
+    (browser User-Agent, Accept-Language: en-US,en;q=0.9, --compressed)
+```
+
+Returns `200` (roughly 340 KB of HTML) containing the printed page count in
+the product's detail bullets. Observed markup fragments:
+
+```
+Print length: 279 pages" href="javascript:void(0)" role="button" class="a-popover-trigger a-
+Print length: 305 pages" href="javascript:void(0)" ...
+```
+
+Verified values: `B009ZUZ9FW` → 279 pages, `B013UWFM52` → 305 pages. German
+locale pages label the same field `Seitenzahl der Print-Ausgabe` instead of
+`Print length`; some pages also carry a `"numberOfPages"` JSON/attribute
+value, accepted as a third, lower-priority pattern. All three patterns strip
+thousands separators (e.g. `1,024 pages` → `1024`) and reject a value that
+isn't a positive integer or that exceeds a sane bound (100000), treating
+either as "not found" rather than trusting a mis-parse.
+
+This request is made **deliberately without the captured Amazon session
+cookie** — it's a public page that doesn't need it, so sending it would (a)
+needlessly expose that session to a request that has no reason to see it and
+(b) make the response session-dependent, defeating the point of caching it
+per asin. Only a browser `User-Agent` and `Accept-Language` are sent.
+
 ### Preference order, most exact first
 
 For each book whose position advanced past its baseline, `wordsRead =
 wordCount(startPosition=baseline, endPosition=current)`. That integer feeds
 one of three tiers, in order:
 
-1. **`print-pages` (exact)** — when the book has an entry in
-   `KINDLE_PAGE_COUNTS` (asin → printed page count, operator-supplied):
-   `pages = (wordsRead / totalWordsInBook) * printedPageCount`, where
-   `totalWordsInBook = wordCount(startPosition=0)` (whole book), cached in KV
-   per asin+contentVersion so it's fetched once per book per revision, not
-   every sync. Not marked as an estimate.
-2. **`words-per-page` (estimated)** — otherwise: `pages = wordsRead /
-   KINDLE_WORDS_PER_PAGE` (var, default `250`, the standard
-   publishing-industry words-per-page convention).
+1. **`print-pages` (exact)** — when a printed page count is available for
+   the book, from either source, in order:
+   - **`KINDLE_PAGE_COUNTS`** (asin → printed page count), an optional,
+     operator-supplied **override**, checked first and requiring no lookup
+     when present.
+   - Otherwise, the **dynamic lookup** above, cached in KV keyed by asin only
+     (`kindle:pageCount:<asin>`, see "Credentials and state" below) — fetched
+     once per book, ever, then reused every sync. A failed lookup (blocked,
+     non-2xx, or unparseable) is cached as a negative marker with a
+     **24-hour TTL**, so a book Amazon won't serve the page for is retried at
+     most once a day rather than on every hourly sync, and falls through to
+     tier 2 for every sync in between.
+
+   Either way: `pages = (wordsRead / totalWordsInBook) * printedPageCount`,
+   where `totalWordsInBook = wordCount(startPosition=0)` (whole book), cached
+   in KV per asin+contentVersion so it's fetched once per book per revision,
+   not every sync — and only once a page count is actually available. Not
+   marked as an estimate. Diagnostics record which of `override` / `lookup` /
+   `none` supplied the page count.
+2. **`words-per-page` (estimated)** — when no page count is available from
+   either source: `pages = wordsRead / KINDLE_WORDS_PER_PAGE` (var, default
+   `250`, the standard publishing-industry words-per-page convention).
 3. **`positions-fallback` (estimated, last resort)** — when `wordCount`
    itself fails for that book (non-2xx, unparseable body, or no
    `contentVersion`/usable `karamelToken` to call it with):
    `positionDelta / KINDLE_POSITIONS_PER_PAGE`, the original mechanism from
    the first verification pass (default `1800`, see "What changed" above).
-   A `wordCount` failure degrades only that book, never the whole sync.
+   A `wordCount` failure degrades only that book, never the whole sync. The
+   page-count lookup is never attempted on this path — it's only worth its
+   cost for a book whose `wordCount` call actually succeeded.
 
 Per-book page contributions are summed as floats across every book, and
 rounded once at the end — not rounded per book, which would compound error
@@ -122,17 +176,19 @@ across books with fractional per-book contributions.
 
 **No book in the account exposed `pageNumberUrl`** (nor `fragmentMapUrl` or
 `manifestUrl`) during either verification pass, so the printed-page-map tier
-from the original draft was dead in practice; it's been replaced outright by
-the `KINDLE_PAGE_COUNTS`-driven exact tier above, which requires an
-operator-supplied page count instead of an Amazon-supplied map.
+from the original draft was dead in practice; it's been replaced by the
+page-count tier above, now driven primarily by the dynamic product-page
+lookup, with `KINDLE_PAGE_COUNTS` kept only as a manual rescue.
 
 A book's own progress fraction — `(position - startPosition) / (endPosition -
 startPosition)`, clamped to `[0, 1]` — is computed separately from
 `metadataUrl` purely for `GET /status` diagnostics; it has no part in the
 pages metric. Diagnostics per book now also include `wordsRead`, `derivation`
-(`"print-pages"` | `"words-per-page"` | `"positions-fallback"`), and `pages`
-contributed. The top-level `estimated` flag stays `true` unless every counted
-book this sync used `print-pages`.
+(`"print-pages"` | `"words-per-page"` | `"positions-fallback"`), `pages`
+contributed, and `pageCountSource` (`"override"` | `"lookup"` | `"none"`) —
+where that book's page count came from, if it had one at all. The top-level
+`estimated` flag stays `true` unless every counted book this sync used
+`print-pages`.
 
 ## Credentials and state
 
@@ -143,7 +199,8 @@ without a redeploy:
 |---|---|
 | `kindle:session` | `{ cookie, updatedAt }` |
 | `kindle:positions` | `{ date, positions: { [asin]: number }, estimated: boolean }` |
-| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision. Keyed by asin AND contentVersion, so a new revision is simply a different key rather than something to compare and invalidate. Written only for books with a `KINDLE_PAGE_COUNTS` entry. Note: the previous revision's key is never deleted when a new one is written, so a content revision leaves one orphaned key behind — harmless, but relevant to manual KV cleanup. |
+| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision. Keyed by asin AND contentVersion, so a new revision is simply a different key rather than something to compare and invalidate. Written only once a page count is available (override or dynamic lookup). Note: the previous revision's key is never deleted when a new one is written, so a content revision leaves one orphaned key behind — harmless, but relevant to manual KV cleanup. |
+| `kindle:pageCount:<asin>` | `{ pages: number \| null }` — the book's discovered printed page count, cached forever on success (`pages` is the count), or `{ pages: null }` on a failed lookup, cached with an `expirationTtl` of one day (86400 seconds) so the lookup retries at most once daily rather than every sync. Keyed by asin ONLY (unlike totalWords) since a printed page count is a property of the print edition, not a content revision. Never consulted or written for a book with a `KINDLE_PAGE_COUNTS` override — the override short-circuits before the cache or the request. |
 
 `kindle:session` holds only the Amazon `Cookie` header string — no device
 identifiers, since the device pair is now a hardcoded constant
@@ -189,10 +246,12 @@ seam, so no generic file changes.
    never advanced except by writing the merged result back at the end.
 6. For each book with an existing baseline whose position advanced past it
    (delta > 0 — otherwise skipped, no request spent): call `wordCount` with
-   `startPosition=baseline&endPosition=current` for `wordsRead`, then derive
-   that book's pages per the preference order above (`print-pages` →
-   `words-per-page` → `positions-fallback`), summing every book's
-   contribution as a float.
+   `startPosition=baseline&endPosition=current` for `wordsRead`. Only once
+   that call succeeds, resolve a page count (override, else cached or freshly
+   discovered from the product page — see "Amazon exposes printed page
+   counts" above) and derive that book's pages per the preference order above
+   (`print-pages` → `words-per-page` → `positions-fallback`), summing every
+   book's contribution as a float.
 7. Round the summed total once. Write back `kindle:positions` (every sync,
    so a fresh mid-day baseline persists) and return the rounded pages.
 
@@ -221,8 +280,14 @@ seam, so no generic file changes.
   `lastPageReadData` (or `null` for a personal document).
 - `pageNumberUrl`, `fragmentMapUrl`, and `manifestUrl` were absent on every
   book tested — in practice, printed-page maps are unavailable through
-  Amazon's own API, which is why the exact tier is now driven by an
-  operator-supplied `KINDLE_PAGE_COUNTS` instead.
+  Amazon's own API, which is why the exact tier is now driven by the
+  product-page lookup below, with `KINDLE_PAGE_COUNTS` kept only as a manual
+  override.
+- `GET https://www.amazon.com/dp/<asin>`, unauthenticated (no cookies), with
+  a browser User-Agent and `Accept-Language: en-US,en;q=0.9`, returns 200
+  (~340 KB HTML) containing the printed page count in the detail bullets —
+  confirmed for `B009ZUZ9FW` (279 pages) and `B013UWFM52` (305 pages), both
+  against the literal `Print length: N pages` markup.
 - `metadataUrl` returns JSONP wrapping `startPosition`/`endPosition`,
   confirmed against three books.
 - `percentageRead` is always `0`, regardless of actual progress.
@@ -255,6 +320,17 @@ seam, so no generic file changes.
   in this integration will pick it up automatically — that tier was removed
   outright (see above), not merely deprioritized. The operator would need to
   add that book to `KINDLE_PAGE_COUNTS` to get an exact page count for it.
+- Whether Amazon serves the product-page request the same way from inside a
+  deployed Cloudflare Worker as it did from a plain live `curl` outside that
+  runtime — verified only from outside the Worker, same caveat as above.
+  A Worker-specific block or bot challenge would make every book's dynamic
+  lookup fail (falling through to `words-per-page`, never failing the sync),
+  but it's untested until the first real deploy. If it does turn out to be
+  blocked in practice, `KINDLE_PAGE_COUNTS` remains available as a full
+  per-book rescue.
+- Long-term behavior of the negative-cache retry cadence (one lookup attempt
+  per day per book) against a real, possibly-blocking Amazon edge — only
+  reasoned about, not observed over any real multi-day window.
 
 ## Out of scope
 
