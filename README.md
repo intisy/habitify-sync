@@ -3,7 +3,7 @@
 A Cloudflare Worker that runs on an hourly cron, reads today's totals from
 connected services, and writes them into matching [Habitify](https://habitify.me)
 habits. It also exposes a small authenticated HTTP API for triggering a sync
-manually and checking status. It currently ships two integrations:
+manually and checking status. It currently ships three integrations:
 
 - **[Strava](src/integrations/strava/README.md)** — activity minutes
 - **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes

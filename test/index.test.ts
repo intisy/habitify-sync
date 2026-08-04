@@ -44,11 +44,11 @@ describe("POST /sync", () => {
 
 describe("GET /status", () => {
   it("returns stored status for a source no longer in the registry", async () => {
-    await writeJson(env.STATE, STATE_KEYS.sourceStatus("kindle"), { state: "ok" } satisfies SourceStatus);
+    await writeJson(env.STATE, STATE_KEYS.sourceStatus("retired-service"), { state: "ok" } satisfies SourceStatus);
     const response = await request("/status", { headers: bearer });
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, SourceStatus>;
-    expect(body.kindle.state).toBe("ok");
+    expect(body["retired-service"].state).toBe("ok");
   });
 
   it("includes a registered source that has never run as null", async () => {
