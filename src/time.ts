@@ -30,11 +30,16 @@ export function timeZoneOffsetMinutes(timeZone: string, at: Date): number {
   return Math.round((asUtc - at.getTime()) / 60000);
 }
 
+function offsetMinutesAtLocalTime(timeZone: string, localIsoWithoutOffset: string): number {
+  const estimateMs = Date.parse(`${localIsoWithoutOffset}Z`);
+  const firstPass = timeZoneOffsetMinutes(timeZone, new Date(estimateMs));
+  return timeZoneOffsetMinutes(timeZone, new Date(estimateMs - firstPass * 60000));
+}
+
 export function localMidnightEpochSeconds(timeZone: string, now: Date): number {
   const today = todayInTimeZone(timeZone, now);
   const utcMidnightMs = Date.parse(`${today}T00:00:00Z`);
-  // Offset sampled at noon local date avoids ambiguity on DST switch days.
-  const offsetMinutes = timeZoneOffsetMinutes(timeZone, new Date(utcMidnightMs + 12 * 3600 * 1000));
+  const offsetMinutes = offsetMinutesAtLocalTime(timeZone, `${today}T00:00:00`);
   return utcMidnightMs / 1000 - offsetMinutes * 60;
 }
 
@@ -48,10 +53,10 @@ function offsetSuffix(offsetMinutes: number): string {
 
 export function isoDayRange(timeZone: string, now: Date): { start: string; end: string } {
   const today = todayInTimeZone(timeZone, now);
-  const noonUtc = new Date(Date.parse(`${today}T12:00:00Z`));
-  const suffix = offsetSuffix(timeZoneOffsetMinutes(timeZone, noonUtc));
+  const startSuffix = offsetSuffix(offsetMinutesAtLocalTime(timeZone, `${today}T00:00:00`));
+  const endSuffix = offsetSuffix(offsetMinutesAtLocalTime(timeZone, `${today}T23:59:59`));
   return {
-    start: `${today}T00:00:00${suffix}`,
-    end: `${today}T23:59:59${suffix}`,
+    start: `${today}T00:00:00${startSuffix}`,
+    end: `${today}T23:59:59${endSuffix}`,
   };
 }
