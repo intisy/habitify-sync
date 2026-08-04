@@ -18,27 +18,61 @@ Pages are derived from **Amazon's own word count** for each book (the
 `renderer/wordCount` endpoint), not from a positions-per-page guess. For each
 book whose position advanced past its baseline, the integration asks Amazon
 for the number of words read between the baseline and current position, then
-converts that to pages in one of two ways, in preference order:
+converts that to pages in one of three ways, in preference order:
 
-1. **Exact**, when you've configured that book's real printed page count in
-   `KINDLE_PAGE_COUNTS` — see [Configuration](#configuration). Pages are
+1. **Exact**, using that book's real printed page count — normally
+   **discovered automatically** from the book's own Amazon product page (see
+   [How the page count is discovered](#how-the-page-count-is-discovered)
+   below), or from the `KINDLE_PAGE_COUNTS` override if you've configured one
+   — see [Configuration](#configuration). Pages are
    `(wordsRead / totalWordsInBook) * printedPageCount`, both word counts
    coming from Amazon.
-2. **Estimated**, otherwise — `wordsRead / KINDLE_WORDS_PER_PAGE` (default
-   `250`, the standard publishing-industry words-per-page convention).
+2. **Estimated**, when no printed page count is available at all —
+   `wordsRead / KINDLE_WORDS_PER_PAGE` (default `250`, the standard
+   publishing-industry words-per-page convention).
+3. **Positions fallback**, last resort — see [Gotchas](#gotchas).
 
 If Amazon's word count can't be fetched for a book (network failure, non-2xx,
 or the book is missing the `contentVersion`/`karamelToken` startReading
 provides), that book alone falls back to the old positions-per-page estimate
 — see [Gotchas](#gotchas). It never fails the sync.
 
+### How the page count is discovered
+
+No configuration is needed for a book's printed page count to be exact. The
+integration fetches the book's public Amazon product page,
+`https://www.amazon.com/dp/<asin>` — the same page anyone can view in a
+browser, logged out — and parses the printed page count out of its detail
+bullets (the "Print length" line, or "Seitenzahl der Print-Ausgabe" on German
+locale pages). This request is deliberately **unauthenticated**: it's sent
+with only a browser `User-Agent` and `Accept-Language`, and no `Cookie` at
+all — the captured Amazon session is never sent to it, since the page doesn't
+need it and sending it would be a needless exposure of that session.
+
+A discovered page count is cached in KV **forever, keyed by asin only** (see
+[Stored state](#stored-state)) — a printed page count is a property of the
+print edition and never changes, so once found it's never fetched again. If
+the product page can't be fetched or parsed (Amazon blocks the request, a
+non-2xx response, or the page simply has no recognizable page-count text),
+that failure is cached too, but only for a day — the book falls back to the
+words-per-page estimate for that sync, and the lookup is retried on the first
+sync after the negative cache entry expires, rather than on every hourly
+sync. Either way, a single book's lookup failure never fails the sync, and
+never affects any other book.
+
+`KINDLE_PAGE_COUNTS` still exists (see [Configuration](#configuration)) but
+is now only a manual **override** — a way to rescue a specific book for which
+the automatic discovery fails, e.g. because Amazon starts blocking the
+Worker's product-page requests. It requires no day-to-day maintenance and,
+for most books, no entries at all.
+
 ## Configuration
 
 | Key | Kind | Where to get it |
 |---|---|---|
 | `HABIT_ID_KINDLE` | Var (`wrangler.toml`) | `curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits` |
-| `KINDLE_WORDS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — words per printed page when no exact print length is configured, default `250` (a standard publishing convention). |
-| `KINDLE_PAGE_COUNTS` | Var (`wrangler.toml`), optional | A JSON object mapping asin to printed page count, e.g. `{"B009ZUZ9FW":272,"B013UWFM52":304}`. Find a book's printed page count on its Amazon product page, under the "Print length" line in the product details (only shown for books with a real print edition). Configuring a book here makes its page count *exact* instead of estimated. |
+| `KINDLE_WORDS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — words per printed page when no printed page count is available at all (neither discovered nor overridden), default `250` (a standard publishing convention). |
+| `KINDLE_PAGE_COUNTS` | Var (`wrangler.toml`), optional, **override only** | Normally left empty — printed page counts are discovered automatically (see [How the page count is discovered](#how-the-page-count-is-discovered)). Only fill this in to rescue a book for which that discovery fails: a JSON object mapping asin to printed page count, e.g. `{"B009ZUZ9FW":272,"B013UWFM52":304}`, found on the book's Amazon product page under "Print length". An entry here always wins over the discovered value for that book. |
 | `KINDLE_POSITIONS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — an estimate of Whispersync position units per printed page, default `1800`. Only used as a last-resort fallback when a book's word count is unavailable. See [Gotchas](#gotchas) for how that default was chosen. |
 
 Example `wrangler.toml` snippet:
@@ -47,12 +81,16 @@ Example `wrangler.toml` snippet:
 [vars]
 HABIT_ID_KINDLE = "abc123"
 KINDLE_WORDS_PER_PAGE = "250"
-KINDLE_PAGE_COUNTS = "{\"B009ZUZ9FW\":272,\"B013UWFM52\":304}"
+# Leave empty in normal operation — only fill in an entry to override a book whose page count
+# Amazon's product page won't yield to the Worker's request.
+KINDLE_PAGE_COUNTS = ""
 ```
 
-Without any entries in `KINDLE_PAGE_COUNTS`, every book uses the
-words-per-page estimate — a good approximation, but not exact, since it
-doesn't account for a specific edition's actual typesetting.
+Without any entries in `KINDLE_PAGE_COUNTS`, every book still gets an exact
+page count whenever its product-page lookup succeeds; only a book whose
+lookup fails (and has no override) falls back to the words-per-page estimate
+— a good approximation, but not exact, since it doesn't account for a
+specific edition's actual typesetting.
 
 No secret is configured for this integration. Unlike Strava or WakaTime, its
 credential (an Amazon session cookie) is not known at deploy time and can
@@ -103,7 +141,8 @@ cached, so it isn't part of this capture.
 |---|---|
 | `kindle:session` | `{ cookie, updatedAt }` — the captured credential |
 | `kindle:positions` | `{ date, positions: { [asin]: number }, estimated }` — today's baseline Whispersync position per book |
-| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision, cached so it's fetched once per book per revision rather than every sync (only written for books with a `KINDLE_PAGE_COUNTS` entry). The old key from a previous revision is never deleted when a new one is written, so a content revision leaves one orphaned key behind — harmless, but worth knowing if you're doing manual KV cleanup. |
+| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision, cached so it's fetched once per book per revision rather than every sync (only written once a printed page count is available, from either the override or the discovered value). The old key from a previous revision is never deleted when a new one is written, so a content revision leaves one orphaned key behind — harmless, but worth knowing if you're doing manual KV cleanup. |
+| `kindle:pageCount:<asin>` | `{ pages }` — the book's discovered printed page count, or `{ pages: null }` for a cached lookup failure. Keyed by asin only (not contentVersion): a printed page count doesn't change when Amazon reflows the book. A successful lookup is cached forever; a failed one expires after a day so it's retried at most once daily rather than every sync. Never written for a book covered by a `KINDLE_PAGE_COUNTS` override, since the override always wins before the lookup (or its cache) is ever consulted. |
 
 To force a fresh baseline, delete `kindle:positions` directly:
 
@@ -128,15 +167,29 @@ or delete the key directly, then redo the [Setup](#setup) capture.
   `endPosition` returns the word count from `startPosition` through the end
   of the book — so `startPosition=0` with no `endPosition` is the whole
   book's word count, used as the denominator for the exact derivation below.
-- **Exact when you configure a print length, otherwise an estimate.** If the
-  book has an entry in `KINDLE_PAGE_COUNTS`, pages are
+- **Exact whenever a printed page count is known, otherwise an estimate.**
+  A printed page count comes from, in order: the `KINDLE_PAGE_COUNTS`
+  override for that asin, if present; otherwise the book's Amazon product
+  page, fetched and parsed automatically (see
+  [How the page count is discovered](#how-the-page-count-is-discovered)) and
+  cached in KV forever once found. Either way, pages are
   `(wordsRead / totalWordsInBook) * printedPageCount` — exact against the
   real print edition, and not marked as an estimate. `totalWordsInBook` is
   fetched once per book per revision and cached in KV (see
-  [Stored state](#stored-state)). Without a configured print length, pages
-  are `wordsRead / KINDLE_WORDS_PER_PAGE` (default `250`, the standard
-  publishing-industry convention) — a good approximation, not exact, since it
-  doesn't account for a specific edition's actual typesetting.
+  [Stored state](#stored-state)), and only once a page count is available at
+  all, from either source. Only a book with no page count from either source
+  — no override, and a failed or not-yet-attempted discovery — uses
+  `wordsRead / KINDLE_WORDS_PER_PAGE` (default `250`, the standard
+  publishing-industry convention) instead — a good approximation, not exact,
+  since it doesn't account for a specific edition's actual typesetting. A
+  book's `GET /status` diagnostics report which of `"override"`, `"lookup"`,
+  or `"none"` supplied its page count.
+- **The product-page lookup only runs for a book that actually contributed
+  this sync** — its position advanced past its baseline AND its `wordCount`
+  call succeeded. A book that's stalled, brand new today, or whose
+  `wordCount` call itself failed never triggers a product-page request at
+  all, matching the same "no wasted requests" principle as `wordCount`
+  itself.
 - **The positions-per-page estimate is now only a last-resort fallback**,
   used when a book's word count can't be fetched at all — no `contentVersion`
   or usable rendering token, a non-2xx response, or an unparseable body. In

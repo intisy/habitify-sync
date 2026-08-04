@@ -15,8 +15,11 @@ HABIT_ID_WAKATIME = ""
 HABIT_ID_KINDLE = ""
 KINDLE_POSITIONS_PER_PAGE = "1800"
 KINDLE_WORDS_PER_PAGE = "250"
-# JSON object mapping asin -> printed page count, e.g. {"B009ZUZ9FW":272,"B013UWFM52":304}.
-# Enables the exact print-pages derivation for those books; see src/integrations/kindle/README.md.
+# OPTIONAL OVERRIDE, not the primary mechanism: printed page counts are discovered automatically
+# from each book's Amazon product page and cached, so this normally needs no entries at all. Only
+# fill it in to rescue a specific book if that automatic discovery fails (e.g. Amazon blocks the
+# Worker's request) — JSON object mapping asin -> printed page count, e.g.
+# {"B009ZUZ9FW":272,"B013UWFM52":304}. See src/integrations/kindle/README.md.
 KINDLE_PAGE_COUNTS = ""
 
 [[kv_namespaces]]

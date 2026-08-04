@@ -17,6 +17,7 @@ interface KindleDiagnostics {
     wordsRead: number;
     derivation: "print-pages" | "words-per-page" | "positions-fallback" | "not-measured";
     pages: number;
+    pageCountSource: "override" | "lookup" | "none";
   }[];
 }
 
@@ -720,6 +721,316 @@ describe("kindleIntegration.fetchToday - print-pages derivation", () => {
     // Sync 3: a new contentVersion (Amazon reflowed the book) must invalidate the cache.
     await kindleIntegration.fetchToday(makeContext(kindleEnv(pageCountsEnv), makeFetch(200000, "different-revision")));
     expect(wholeBookCallCount).toBe(2);
+  });
+});
+
+// The public, unauthenticated product page the dynamic page-count lookup fetches — verified live
+// (see the design doc) to carry the printed page count in its detail bullets, with no auth needed.
+const PRODUCT_PAGE_URL = "https://www.amazon.com/dp";
+
+// Wraps fetchForWordCountBook's book-reading/wordCount handling with a product-page handler, so
+// tests can drive the dynamic page-count lookup independently of the book's other endpoints.
+function fetchWithProductPage(options: {
+  wordCountByRange: Record<string, number | "error">;
+  position?: number;
+  contentVersion?: string;
+  productPageResponse: (asin: string) => Response;
+  onProductPageCall?: (url: URL, headers: Headers) => void;
+}) {
+  const base = fetchForWordCountBook({
+    asin: WORDCOUNT_BOOK.asin,
+    contentVersion: options.contentVersion ?? WORDCOUNT_BOOK.contentVersion,
+    position: options.position ?? WORDCOUNT_BOOK.position,
+    karamelToken: DUMMY_RENDERING_TOKEN,
+    wordCountByRange: options.wordCountByRange,
+  });
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith(PRODUCT_PAGE_URL)) {
+      const parsed = new URL(url);
+      const asin = parsed.pathname.split("/").pop()!;
+      options.onProductPageCall?.(parsed, new Headers(init?.headers));
+      return options.productPageResponse(asin);
+    }
+    return base(input, init);
+  }) as typeof fetch;
+}
+
+// A fragment of real, verified Amazon product-page HTML (see the design doc), trimmed to just the
+// detail-bullet text the parser looks for. The English fragment mirrors the exact markup observed
+// live: `Print length: 279 pages" href="javascript:void(0)" ...`.
+function englishPrintLengthHtml(pages: number | string): string {
+  return `<span>Print length: ${pages} pages" href="javascript:void(0)" role="button" class="a-popover-trigger a-</span>`;
+}
+
+function germanPrintLengthHtml(pages: number | string): string {
+  return `<span>Seitenzahl der Print-Ausgabe: ${pages} Seiten</span>`;
+}
+
+function numberOfPagesJsonHtml(pages: number | string): string {
+  return `<script type="application/ld+json">{"@type":"Book","numberOfPages":"${pages}"}</script>`;
+}
+
+describe("kindleIntegration.fetchToday - dynamic page-count lookup", () => {
+  beforeEach(async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.session, DUMMY_SESSION);
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.baseline },
+      estimated: false,
+    } satisfies KindlePositions);
+  });
+
+  it("requests the product page at the correct URL with a browser User-Agent and sends no Cookie header", async () => {
+    let seenUrl: URL | undefined;
+    let seenHeaders: Headers | undefined;
+    const fetchFn = fetchWithProductPage({
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+      productPageResponse: () => new Response(englishPrintLengthHtml(279)),
+      onProductPageCall: (url, headers) => {
+        seenUrl = url;
+        seenHeaders = headers;
+      },
+    });
+
+    await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+
+    expect(seenUrl?.toString()).toBe(`${PRODUCT_PAGE_URL}/${WORDCOUNT_BOOK.asin}`);
+    expect(seenHeaders?.get("User-Agent")).toMatch(/Mozilla/);
+    // The product page is public; sending the captured Amazon session cookie here would leak it
+    // to a request that doesn't need it and need not ever see it.
+    expect(seenHeaders?.has("Cookie")).toBe(false);
+  });
+
+  it.each([
+    ["the English 'Print length' label", englishPrintLengthHtml(279), 279],
+    ["the German 'Seitenzahl der Print-Ausgabe' label", germanPrintLengthHtml(305), 305],
+    ["a 'numberOfPages' JSON field", numberOfPagesJsonHtml(272), 272],
+    ["a thousands separator", englishPrintLengthHtml("1,024"), 1024],
+  ])("discovers the page count from %s", async (_label, html, expectedPageCount) => {
+    const fetchFn = fetchWithProductPage({
+      wordCountByRange: {
+        [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE,
+        "0-": WORDS_IN_WHOLE_BOOK,
+      },
+      productPageResponse: () => new Response(html),
+    });
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    const book = diagnosticsOf(values[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book?.derivation).toBe("print-pages");
+    expect(book?.pageCountSource).toBe("lookup");
+    expect(book?.pages).toBeCloseTo((WORDS_IN_RANGE / WORDS_IN_WHOLE_BOOK) * expectedPageCount, 1);
+  });
+
+  it.each([
+    ["a non-numeric value", englishPrintLengthHtml("N/A")],
+    ["a zero page count", englishPrintLengthHtml(0)],
+    ["an absurdly large page count", englishPrintLengthHtml(999999999)],
+    ["no recognizable page-count text at all", "<html><body>nothing relevant here</body></html>"],
+  ])("falls back to words-per-page and reports source 'none' when the product page has %s", async (_label, html) => {
+    const fetchFn = fetchWithProductPage({
+      wordCountByRange: { [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE },
+      productPageResponse: () => new Response(html),
+    });
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    const book = diagnosticsOf(values[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book?.derivation).toBe("words-per-page");
+    expect(book?.pageCountSource).toBe("none");
+    expect(diagnosticsOf(values[0])?.estimated).toBe(true);
+  });
+
+  it("derives pages exactly end-to-end from real verified numbers: B009ZUZ9FW, 43090/98651 words, 279 discovered pages", async () => {
+    const fetchFn = fetchWithProductPage({
+      wordCountByRange: {
+        [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE,
+        "0-": WORDS_IN_WHOLE_BOOK,
+      },
+      productPageResponse: () => new Response(englishPrintLengthHtml(279)),
+    });
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    const book = diagnosticsOf(values[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    // (43090/98651)*279 ≈ 121.87.
+    expect(book?.pages).toBeCloseTo(121.9, 1);
+    expect(book?.derivation).toBe("print-pages");
+    expect(book?.pageCountSource).toBe("lookup");
+    expect(diagnosticsOf(values[0])?.estimated).toBe(false);
+  });
+
+  it("prefers the KINDLE_PAGE_COUNTS override over the dynamic lookup, and makes no product-page request", async () => {
+    let productPageCallCount = 0;
+    const fetchFn = fetchWithProductPage({
+      wordCountByRange: {
+        [`0-${WORDCOUNT_BOOK.position}`]: WORDS_IN_RANGE,
+        "0-": WORDS_IN_WHOLE_BOOK,
+      },
+      productPageResponse: () => {
+        throw new Error("the override must make the dynamic lookup unnecessary");
+      },
+      onProductPageCall: () => {
+        productPageCallCount++;
+      },
+    });
+
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_PAGE_COUNTS: `{"${WORDCOUNT_BOOK.asin}":272}` }), fetchFn),
+    );
+
+    expect(productPageCallCount).toBe(0);
+    const book = diagnosticsOf(values[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book?.derivation).toBe("print-pages");
+    expect(book?.pageCountSource).toBe("override");
+    // (43090/98651)*272 ≈ 118.8, confirming the override's value (not the lookup's 279) was used.
+    expect(book?.pages).toBeCloseTo(118.8, 1);
+  });
+
+  it("caches a discovered page count in KV and does not refetch the product page on a later sync", async () => {
+    // The day's baseline (set by the describe's beforeEach) stays fixed at 0 for the whole day —
+    // only a book's FIRST sighting of the day ever records a baseline (see the "page delta math
+    // and baseline lifecycle" describe block above). So every sync this same day measures
+    // wordsRead over [0, currentPosition], a growing range, not [previousPosition, currentPosition].
+    let productPageCallCount = 0;
+    const makeFetch = (position: number, wordsInRange: number) =>
+      fetchWithProductPage({
+        wordCountByRange: {
+          [`0-${position}`]: wordsInRange,
+          "0-": WORDS_IN_WHOLE_BOOK,
+        },
+        position,
+        productPageResponse: () => new Response(englishPrintLengthHtml(279)),
+        onProductPageCall: () => {
+          productPageCallCount++;
+        },
+      });
+
+    // Sync 1: position 100000, discovers and caches the page count.
+    await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch(100000, 1000)));
+    expect(productPageCallCount).toBe(1);
+
+    // Sync 2: position advances further, same day and same baseline. The cached page count must
+    // be reused, with no second product-page request.
+    await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch(150000, 1500)));
+    expect(productPageCallCount).toBe(1);
+  });
+
+  it("caches a failed lookup negatively and does not retry the product page on a later sync the same day", async () => {
+    let productPageCallCount = 0;
+    const makeFetch = (position: number) =>
+      fetchWithProductPage({
+        wordCountByRange: { [`0-${position}`]: 1000 },
+        position,
+        productPageResponse: () => {
+          productPageCallCount++;
+          return new Response("service unavailable", { status: 503 });
+        },
+      });
+
+    // Sync 1: the product page fails; the book still contributes via words-per-page.
+    const sync1 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch(100000)));
+    const book1 = diagnosticsOf(sync1[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book1?.derivation).toBe("words-per-page");
+    expect(book1?.pageCountSource).toBe("none");
+    expect(productPageCallCount).toBe(1);
+
+    // Sync 2: position advances further, same day/baseline. The negative cache marker must
+    // suppress a second product-page request entirely.
+    const sync2 = await kindleIntegration.fetchToday(makeContext(kindleEnv(), makeFetch(150000)));
+    const book2 = diagnosticsOf(sync2[0])?.books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    expect(book2?.derivation).toBe("words-per-page");
+    expect(productPageCallCount).toBe(1);
+  });
+
+  it("degrades only the affected book to words-per-page on a 503, while another book (using the override) still counts", async () => {
+    const overriddenAsin = "ASINOVERRIDDEN";
+    const wordCountBookMetadataUrl = `https://cdn.example.com/metadata/${WORDCOUNT_BOOK.asin}`;
+    const overriddenMetadataUrl = `https://cdn.example.com/metadata/${overriddenAsin}`;
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse([WORDCOUNT_BOOK.asin, overriddenAsin]);
+      if (url.startsWith(START_READING_URL)) {
+        const asin = new URL(url).searchParams.get("asin")!;
+        if (asin === overriddenAsin) {
+          return Response.json({
+            lastPageReadData: { position: 5000 },
+            contentVersion: "rev-overridden",
+            karamelToken: DUMMY_RENDERING_TOKEN,
+            metadataUrl: overriddenMetadataUrl,
+          });
+        }
+        return Response.json({
+          lastPageReadData: { position: WORDCOUNT_BOOK.position },
+          contentVersion: WORDCOUNT_BOOK.contentVersion,
+          karamelToken: DUMMY_RENDERING_TOKEN,
+          metadataUrl: wordCountBookMetadataUrl,
+        });
+      }
+      // Arbitrary but valid span, purely so a progress fraction exists and each book gets a
+      // diagnostics entry — the page-count math under test never reads this endpoint.
+      if (url === wordCountBookMetadataUrl || url === overriddenMetadataUrl) {
+        return new Response(jsonp({ startPosition: 0, endPosition: 1000000 }));
+      }
+      if (url.startsWith(PRODUCT_PAGE_URL)) return new Response("service unavailable", { status: 503 });
+      if (url.startsWith(WORD_COUNT_URL)) {
+        const parsed = new URL(url);
+        const revision = parsed.searchParams.get("revision");
+        if (revision === "rev-overridden") return Response.json({ wordCount: 500 });
+        if (revision === WORDCOUNT_BOOK.contentVersion) return Response.json({ wordCount: WORDS_IN_RANGE });
+        throw new Error(`unexpected wordCount revision ${revision}`);
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.baseline, [overriddenAsin]: 0 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_PAGE_COUNTS: `{"${overriddenAsin}":250}` }), fetchFn),
+    );
+    const books = diagnosticsOf(values[0])?.books ?? [];
+    const wordCountBook = books.find((entry) => entry.asin === WORDCOUNT_BOOK.asin);
+    const overriddenBook = books.find((entry) => entry.asin === overriddenAsin);
+    expect(wordCountBook?.derivation).toBe("words-per-page");
+    expect(wordCountBook?.pageCountSource).toBe("none");
+    expect(overriddenBook?.derivation).toBe("print-pages");
+    expect(overriddenBook?.pageCountSource).toBe("override");
+  });
+
+  it("makes no product-page request for a book that contributed nothing this sync", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { [WORDCOUNT_BOOK.asin]: WORDCOUNT_BOOK.position },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith(DEVICE_TOKEN_URL)) return Response.json({ deviceSessionToken: "token" });
+      if (url.startsWith(LIBRARY_URL)) return libraryResponse([WORDCOUNT_BOOK.asin]);
+      if (url.startsWith(START_READING_URL)) {
+        // Position unchanged from the stored baseline: delta is 0, so nothing should be looked up.
+        return Response.json({
+          lastPageReadData: { position: WORDCOUNT_BOOK.position },
+          contentVersion: WORDCOUNT_BOOK.contentVersion,
+          karamelToken: DUMMY_RENDERING_TOKEN,
+        });
+      }
+      if (url.startsWith(PRODUCT_PAGE_URL)) {
+        throw new Error("the product page must not be requested for a book that did not advance");
+      }
+      if (url.startsWith(WORD_COUNT_URL)) {
+        throw new Error("wordCount must not be called for a book that has not advanced past its baseline");
+      }
+      throw new Error(`unexpected fetch to ${url}`);
+    }) as typeof fetch;
+
+    const values = await kindleIntegration.fetchToday(makeContext(kindleEnv(), fetchFn));
+    expect(values).toEqual([expect.objectContaining({ value: 0 })]);
   });
 });
 
