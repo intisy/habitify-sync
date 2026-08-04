@@ -77,4 +77,13 @@ describe("stravaSource", () => {
     const fetchFn = (async () => new Response("unauthorized", { status: 401 })) as typeof fetch;
     await expect(stravaSource.fetchToday(makeContext(stravaEnv(), fetchFn))).rejects.toThrow(AuthNeededError);
   });
+
+  it("throws a clear error when the activities payload shape is unexpected", async () => {
+    const valid: StravaTokens = { accessToken: "access", refreshToken: "refresh", expiresAt: 9999999999 };
+    await writeJson(env.STATE, STATE_KEYS.stravaTokens, valid);
+    const fetchFn = (async () => Response.json({ not: "an array" })) as typeof fetch;
+    await expect(stravaSource.fetchToday(makeContext(stravaEnv(), fetchFn))).rejects.toThrow(
+      "Strava returned an unexpected payload shape",
+    );
+  });
 });

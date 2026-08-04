@@ -21,6 +21,11 @@ export const wakatimeSource: Source = {
       throw new Error(`WakaTime summaries request failed with status ${response.status}`);
     }
     const summaries = (await response.json()) as WakatimeSummaries;
+    // WakaTime can return 202 (still computing) with a body that isn't the expected shape,
+    // which passes response.ok but would otherwise throw a cryptic TypeError below.
+    if (!Array.isArray(summaries.data)) {
+      throw new Error("WakaTime returned an unexpected payload shape");
+    }
     const totalSeconds = summaries.data.reduce((sum, day) => sum + day.grand_total.total_seconds, 0);
     return [{ habitId: env.HABIT_ID_WAKATIME!, value: Math.round(totalSeconds / 60), unit: "min" }];
   },

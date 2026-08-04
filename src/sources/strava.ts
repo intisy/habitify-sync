@@ -89,6 +89,9 @@ export const stravaSource: Source = {
       throw new Error(`Strava activities request failed with status ${response.status}`);
     }
     const activities = (await response.json()) as { moving_time: number }[];
+    if (!Array.isArray(activities)) {
+      throw new Error("Strava returned an unexpected payload shape");
+    }
     const totalSeconds = activities.reduce((sum, activity) => sum + activity.moving_time, 0);
     return [{ habitId: env.HABIT_ID_STRAVA!, value: Math.round(totalSeconds / 60), unit: "min" }];
   },

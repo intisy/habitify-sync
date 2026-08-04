@@ -34,4 +34,13 @@ describe("wakatimeSource", () => {
     const testEnv: Env = { ...env, WAKATIME_API_KEY: "waka-key", HABIT_ID_WAKATIME: "habit-w" };
     await expect(wakatimeSource.fetchToday(makeContext(testEnv, fetchFn))).rejects.toThrow("WakaTime");
   });
+
+  it("throws a clear error when the payload shape is unexpected", async () => {
+    // e.g. WakaTime's 202 "still computing" response, which still passes response.ok
+    const fetchFn = (async () => Response.json({ data: "not-an-array" })) as typeof fetch;
+    const testEnv: Env = { ...env, WAKATIME_API_KEY: "waka-key", HABIT_ID_WAKATIME: "habit-w" };
+    await expect(wakatimeSource.fetchToday(makeContext(testEnv, fetchFn))).rejects.toThrow(
+      "WakaTime returned an unexpected payload shape",
+    );
+  });
 });
