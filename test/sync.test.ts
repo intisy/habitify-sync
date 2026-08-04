@@ -21,6 +21,7 @@ describe("runSync", () => {
   beforeEach(async () => {
     await env.STATE.delete(STATE_KEYS.sourceStatus("good"));
     await env.STATE.delete(STATE_KEYS.sourceStatus("broken"));
+    await env.STATE.delete(STATE_KEYS.sourceStatus("off"));
   });
 
   it("pushes values to Habitify and records ok status", async () => {
@@ -75,6 +76,8 @@ describe("runSync", () => {
     };
     const results = await runSync(env, [disabled], now, habitifyFetchRecorder([]));
     expect(results[0].status.state).toBe("disabled");
+    const stored = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus("off"));
+    expect(stored?.state).toBe("disabled");
   });
 
   it("filters to a single source when onlySource is given", async () => {

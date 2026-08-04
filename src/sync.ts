@@ -25,7 +25,9 @@ export async function runSync(
   for (const source of sources) {
     if (onlySource && source.name !== onlySource) continue;
     if (!source.enabled(env)) {
-      results.push({ source: source.name, status: { state: "disabled" } });
+      const disabledStatus: SourceStatus = { state: "disabled" };
+      await writeJson(env.STATE, STATE_KEYS.sourceStatus(source.name), disabledStatus);
+      results.push({ source: source.name, status: disabledStatus });
       continue;
     }
 
