@@ -70,7 +70,17 @@ fallback is recorded per-source and visible in `GET /status`.
    the first deploy** — the worker will not read or write state correctly
    otherwise.
 
-3. Find your Habitify habit ids and fill them into `wrangler.toml`
+3. Each integration needs a Habitify habit to log into. Create one either in
+   the Habitify app itself, or — once the worker is deployed and
+   `HABITIFY_API_KEY` is set — via `POST /habits` (see
+   [HTTP API](#http-api) below), which provisions it without the key ever
+   leaving Cloudflare. Either way, if you give the habit a measurable goal,
+   its `unit` must be one of Habitify's own unit symbols (see
+   `HABITIFY_UNIT_SYMBOLS` in `src/habitify.ts`) — notably there is **no**
+   `pages` unit, so a page-counting habit (e.g. for Kindle) should use `rep`
+   instead.
+
+   Find your Habitify habit ids and fill them into `wrangler.toml`
    (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`). Before the
    first deploy, the only option is a direct call using your
    `HABITIFY_API_KEY` locally (requires a paid Habitify subscription — the
@@ -141,6 +151,7 @@ one-time setup steps (OAuth consent, callback domains, and the like):
 | `POST /sync` (optional `?source=strava\|wakatime\|kindle`) | `admin` | Force a sync of all integrations, or just one |
 | `GET /status` | `admin` | Last run outcome per integration |
 | `GET /habits` | `admin` | List Habitify habit ids/names/units, for filling into `wrangler.toml` |
+| `POST /habits` | `admin` | Create a new Habitify habit, so one exists to log into before `wrangler.toml` is filled in |
 | `GET /strava/authorize` | `admin-or-query-token` | Start the one-time Strava OAuth flow ([details](src/integrations/strava/README.md#routes)) |
 | `GET /strava/callback` | `public` | Finishes the Strava OAuth exchange ([details](src/integrations/strava/README.md#routes)) |
 | `PUT /kindle/session` | `admin` | Store the captured Kindle session ([details](src/integrations/kindle/README.md#routes)) |
@@ -168,6 +179,11 @@ curl -X POST "https://<worker-url>/sync?source=wakatime" \
 
 curl "https://<worker-url>/status" \
   -H "Authorization: Bearer $ADMIN_TOKEN"
+
+curl -X POST "https://<worker-url>/habits" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Read", "goal": {"periodicity": "daily", "value": 10, "unit": "rep"}}'
 ```
 
 ## Adding a new integration
