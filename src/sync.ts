@@ -19,8 +19,27 @@ export async function runSync(
 ): Promise<SyncResult[]> {
   const timeZone = env.TIMEZONE || DEFAULT_TIME_ZONE;
   const context: SourceContext = { env, timeZone, today: todayInTimeZone(timeZone, now), now, fetchFn };
-  const habitify = new HabitifyClient(env.HABITIFY_API_KEY, fetchFn);
   const results: SyncResult[] = [];
+
+  // Without this, a missing key would make every enabled source fail with a 401 buried in
+  // lastError, hourly, forever. Fail fast with one clear message per source instead.
+  if (!env.HABITIFY_API_KEY) {
+    for (const source of sources) {
+      if (onlySource && source.name !== onlySource) continue;
+      const previous = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
+      const status: SourceStatus = {
+        state: "error",
+        lastSuccessAt: previous?.lastSuccessAt,
+        lastErrorAt: now.toISOString(),
+        lastError: "HABITIFY_API_KEY is not configured",
+      };
+      await writeJson(env.STATE, STATE_KEYS.sourceStatus(source.name), status);
+      results.push({ source: source.name, status });
+    }
+    return results;
+  }
+
+  const habitify = new HabitifyClient(env.HABITIFY_API_KEY, fetchFn);
 
   for (const source of sources) {
     if (onlySource && source.name !== onlySource) continue;
