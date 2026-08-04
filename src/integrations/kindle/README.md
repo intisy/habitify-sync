@@ -8,8 +8,21 @@
 
 ## What it logs
 
-Pages read today, as the `pages` unit, into the Habitify habit configured by
-`HABIT_ID_KINDLE`. The value is the sum, across every book in the library, of
+Pages read today into the Habitify habit configured by `HABIT_ID_KINDLE`.
+This integration declares its value's semantic unit as `"pages"` — the
+honest description of what's being counted — but `"pages"` is **not** one of
+Habitify's own accepted unit symbols, so it is never sent to Habitify
+verbatim. Instead, `src/sync.ts` resolves the actual unit sent once per sync
+run: it's logged against whatever unit the `HABIT_ID_KINDLE` habit is
+*itself* configured with in Habitify (any valid Habitify unit — `"rep"` is a
+sensible choice for a count like pages); if that habit has no configured
+unit, the log falls back to `"rep"`. Either way, `GET /status` on this
+integration reports `unit: "pages"` for diagnostic purposes, and the
+top-level source status notes if a unit fallback happened. See the root
+[README's "How it works"](../../../README.md#how-it-works) for the general
+mechanism.
+
+The value is the sum, across every book in the library, of
 `max(0, pagesSinceBaseline)`, where the baseline is each book's Whispersync
 *position* (not a derived page number) at the first sync of the current local
 day.
@@ -70,7 +83,7 @@ for most books, no entries at all.
 
 | Key | Kind | Where to get it |
 |---|---|---|
-| `HABIT_ID_KINDLE` | Var (`wrangler.toml`) | `curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits` |
+| `HABIT_ID_KINDLE` | Var (`wrangler.toml`) | `curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits` |
 | `KINDLE_WORDS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — words per printed page when no printed page count is available at all (neither discovered nor overridden), default `250` (a standard publishing convention). |
 | `KINDLE_PAGE_COUNTS` | Var (`wrangler.toml`), optional, **override only** | Normally left empty — printed page counts are discovered automatically (see [How the page count is discovered](#how-the-page-count-is-discovered)). Only fill this in to rescue a book for which that discovery fails: a JSON object mapping asin to printed page count, e.g. `{"B009ZUZ9FW":272,"B013UWFM52":304}`, found on the book's Amazon product page under "Print length". An entry here always wins over the discovered value for that book. |
 | `KINDLE_POSITIONS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — an estimate of Whispersync position units per printed page, default `1800`. Only used as a last-resort fallback when a book's word count is unavailable. See [Gotchas](#gotchas) for how that default was chosen. |

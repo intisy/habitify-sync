@@ -29,9 +29,24 @@ others. After every run, each integration's outcome — success, error, or
 `STATE` KV namespace, readable via `GET /status`.
 
 Habitify's log API only appends, so writing a value twice would double-count
-it. To make hourly reruns idempotent, every write is an upsert: delete
-today's existing logs for the habit, then post the current total. Rerunning
-the same hour with the same source data converges to the same result.
+it. To make hourly reruns idempotent, every write is an upsert: undo today's
+existing logs for the habit (Habitify v2 has no range-delete for logs, only
+per-log delete by id with no way to list log ids, so `POST .../logs/undo` is
+the primitive instead — see [Operational notes](#operational-notes--gotchas)),
+then post the current total. Rerunning the same hour with the same source
+data converges to the same result.
+
+Habitify only accepts logs against its own closed set of unit symbols (see
+`HABITIFY_UNIT_SYMBOLS` in `src/habitify.ts`), which doesn't include every
+unit an integration might declare (Kindle declares `"pages"`, which isn't a
+Habitify unit). So the worker looks up each habit's own configured unit once
+per sync run and prefers it over the integration's declared unit whenever
+it's present and valid — falling back to the integration's unit, and finally
+to `"rep"` (the generic count unit), only when the habit has no usable unit
+of its own. This means **a Habitify habit's configured unit does not need to
+match the integration's semantic unit** — configure the habit however you
+like (e.g. `"rep"` for Kindle pages) and the worker adapts automatically. Any
+fallback is recorded per-source and visible in `GET /status`.
 
 ## Setup
 
@@ -58,10 +73,11 @@ the same hour with the same source data converges to the same result.
 3. Find your Habitify habit ids and fill them into `wrangler.toml`
    (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`). Before the
    first deploy, the only option is a direct call using your
-   `HABITIFY_API_KEY` locally:
+   `HABITIFY_API_KEY` locally (requires a paid Habitify subscription — the
+   API is not available on the free plan):
 
    ```bash
-   curl -H "Authorization: <HABITIFY_API_KEY>" https://api.habitify.me/habits
+   curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits
    ```
 
    Once the worker is deployed (step 6) and `HABITIFY_API_KEY` is set as a
@@ -72,9 +88,10 @@ the same hour with the same source data converges to the same result.
    curl "https://<worker-url>/habits" -H "Authorization: Bearer $ADMIN_TOKEN"
    ```
 
-   Either way, fill the resulting ids into `wrangler.toml` and redeploy.
-   Make sure each habit's unit in Habitify matches what the worker logs:
-   minutes for Strava and WakaTime, pages for Kindle. Leave `HABIT_ID_KINDLE`
+   Either way, fill the resulting ids into `wrangler.toml` and redeploy. Each
+   habit's unit in Habitify does **not** need to match what the worker logs
+   — the worker discovers each habit's own configured unit automatically and
+   prefers it (see [How it works](#how-it-works)). Leave `HABIT_ID_KINDLE`
    blank to leave that integration disabled — see its README for the
    one-time Amazon cookie capture it needs instead.
 
@@ -190,9 +207,25 @@ No other file needs to change — `src/index.ts` builds its route table from
 
 ## Operational notes / gotchas
 
-- **The worker owns its habits.** Every sync deletes today's existing logs
-  for a habit before posting the new total. Any manual entry you add for
-  today in the Habitify app will be wiped on the next hourly run.
+- **The worker owns its habits.** Every sync undoes today's existing logs
+  for a habit (`POST /habits/{habitId}/logs/undo`) before posting the new
+  total. Any manual entry you add for today in the Habitify app will be
+  wiped on the next hourly run.
+
+- **Habitify API v2.** The worker talks to `https://api.habitify.me/v2`
+  using an `X-API-Key` header (the retired v1 API used
+  `Authorization: <key>` with no `/v2` prefix and no `X-API-Key` header —
+  requests against it now fail with 401). API access requires a paid
+  Habitify subscription; it is not available on the free plan.
+
+- **Habit units are resolved automatically, not hardcoded.** Habitify only
+  accepts a closed set of unit symbols, and an integration's own semantic
+  unit (Kindle's `"pages"`) may not be one of them. Once per sync run the
+  worker looks up every habit's own configured unit and prefers it over the
+  integration's declared unit; falling back to the integration's unit (if
+  valid) or `"rep"` only when the habit has no usable unit of its own. Any
+  fallback is recorded in that source's `GET /status` entry under
+  `unitFallbacks`.
 
 - **Timezone.** `TIMEZONE` (default `Europe/Berlin`) defines what "today"
   means for the worker — it's used both to pick the day boundary for Strava
@@ -207,7 +240,7 @@ No other file needs to change — `src/index.ts` builds its route table from
   report `"state": "error"` with a `lastError` message. An integration whose
   required secrets aren't set reports `"state": "disabled"`.
 
-- **The upsert isn't atomic.** If the DELETE of today's logs succeeds but
+- **The upsert isn't atomic.** If the undo of today's logs succeeds but
   the following POST fails, today's value is left empty in Habitify until
   the next hourly run repairs it.
 
