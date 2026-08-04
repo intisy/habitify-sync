@@ -143,7 +143,7 @@ without a redeploy:
 |---|---|
 | `kindle:session` | `{ cookie, updatedAt }` |
 | `kindle:positions` | `{ date, positions: { [asin]: number }, estimated: boolean }` |
-| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision. Keyed by asin AND contentVersion, so a new revision is simply a different key rather than something to compare and invalidate. Written only for books with a `KINDLE_PAGE_COUNTS` entry. |
+| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision. Keyed by asin AND contentVersion, so a new revision is simply a different key rather than something to compare and invalidate. Written only for books with a `KINDLE_PAGE_COUNTS` entry. Note: the previous revision's key is never deleted when a new one is written, so a content revision leaves one orphaned key behind — harmless, but relevant to manual KV cleanup. |
 
 `kindle:session` holds only the Amazon `Cookie` header string — no device
 identifiers, since the device pair is now a hardcoded constant
@@ -251,6 +251,10 @@ seam, so no generic file changes.
   personal document, which is already excluded upstream by
   `lastPageReadData: null`) — not directly exercised, since no such case
   reaches this code path in practice.
+- If a book ever does expose a real `pageNumberUrl` map in the future, nothing
+  in this integration will pick it up automatically — that tier was removed
+  outright (see above), not merely deprioritized. The operator would need to
+  add that book to `KINDLE_PAGE_COUNTS` to get an exact page count for it.
 
 ## Out of scope
 

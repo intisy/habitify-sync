@@ -103,7 +103,7 @@ cached, so it isn't part of this capture.
 |---|---|
 | `kindle:session` | `{ cookie, updatedAt }` — the captured credential |
 | `kindle:positions` | `{ date, positions: { [asin]: number }, estimated }` — today's baseline Whispersync position per book |
-| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision, cached so it's fetched once per book per revision rather than every sync (only written for books with a `KINDLE_PAGE_COUNTS` entry) |
+| `kindle:totalWords:<asin>:<contentVersion>` | A single number — that book's whole-book word count at that revision, cached so it's fetched once per book per revision rather than every sync (only written for books with a `KINDLE_PAGE_COUNTS` entry). The old key from a previous revision is never deleted when a new one is written, so a content revision leaves one orphaned key behind — harmless, but worth knowing if you're doing manual KV cleanup. |
 
 To force a fresh baseline, delete `kindle:positions` directly:
 
