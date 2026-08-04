@@ -28,26 +28,40 @@ one registry entry, its secrets.
 
 ## Architecture
 
+**Superseded by** `2026-08-04-modular-integrations.md`, which moved each
+integration (implementation, routes, KV state, tests, README) into its own
+directory under `src/integrations/<name>/`. The file tree and extension
+point below describe that layout — see the modular-integrations doc for the
+full design and the `Integration` interface.
+
 ```
 src/
-  index.ts          worker entry: scheduled (hourly cron) + fetch (HTTP API)
-  sync.ts           orchestrator: run all sources, isolate failures, record status
+  index.ts          worker entry: scheduled (hourly cron) + fetch (HTTP API), route dispatch
+  sync.ts           orchestrator: run all integrations, isolate failures, record status
   habitify.ts       Habitify API client (upsert today's log per habit)
-  state.ts          KV access (tokens, sync status)
-  sources/
-    types.ts        the Source interface — the extension point
-    strava.ts
-    wakatime.ts
-    # kindle.ts — not implemented, see "Kindle — Not implemented" below
+  state.ts          generic KV helpers only (tokens/routes/state live with each integration)
+  integrations/
+    types.ts        the Integration interface — the extension point
+    registry.ts     INTEGRATIONS array — the one place to register
+    strava/
+      index.ts      fetchToday + its OAuth routes + its own KV keys
+      index.test.ts
+      README.md
+    wakatime/
+      index.ts
+      index.test.ts
+      README.md
+    # kindle/ — not implemented, see "Kindle — Not implemented" below
 ```
 
 ### Extension point
 
 ```ts
-interface Source {
+interface Integration {
   name: string;
   enabled(env: Env): boolean;            // true when its secrets/vars are set
   fetchToday(ctx: SourceContext): Promise<HabitValue[]>;
+  routes?: IntegrationRoute[];           // HTTP endpoints it contributes, if any
 }
 
 interface HabitValue {
@@ -57,12 +71,13 @@ interface HabitValue {
 }
 ```
 
-`sync.ts` iterates a registry array of sources. Each source runs inside its own
-try/catch; results are pushed to Habitify and a per-source status record (last
-success time, last error) is written to KV. One broken source never blocks the
-others.
+`sync.ts` iterates a registry array of integrations. Each integration runs
+inside its own try/catch; results are pushed to Habitify and a per-integration
+status record (last success time, last error) is written to KV. One broken
+integration never blocks the others.
 
-**Adding a new app** = one file in `sources/` implementing `Source` + one
+**Adding a new app** = one directory in `integrations/` implementing
+`Integration` (with its own routes and KV keys if it needs any) + one
 registry entry + its secrets/vars. Documented as a recipe in the README.
 
 ## Per-source behavior

@@ -3,21 +3,29 @@
 A Cloudflare Worker that runs on an hourly cron, reads today's totals from
 connected services, and writes them into matching [Habitify](https://habitify.me)
 habits. It also exposes a small authenticated HTTP API for triggering a sync
-manually and checking status. It currently ships two sources: **Strava**
-(activity minutes) and **WakaTime** (coding minutes).
+manually and checking status. It currently ships two integrations:
+
+- **[Strava](src/integrations/strava/README.md)** — activity minutes
+- **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes
 
 ## How it works
 
-Each integration implements a small `Source` interface (see below) with a
-`fetchToday` method that returns today's value(s). `src/sources/registry.ts`
-lists the active sources; `src/sync.ts` iterates that list once per run
-(hourly via cron, or on demand via `POST /sync`).
+Each integration implements the `Integration` interface (see
+`src/integrations/types.ts`), whose `fetchToday` method returns today's
+value(s). `src/integrations/registry.ts` lists the active integrations;
+`src/sync.ts` iterates that list once per run (hourly via cron, or on demand
+via `POST /sync`).
 
-Each source runs inside its own `try`/`catch`, so one source failing (an
-expired Strava token, a WakaTime outage) never blocks the others. After every
-run, each source's outcome — success, error, or "needs re-auth" — is written
-to a per-source status record in the `STATE` KV namespace, readable via
-`GET /status`.
+An integration can also contribute HTTP routes (for an OAuth handshake, for
+example) and its own KV state, entirely inside its own directory —
+`src/index.ts` and `src/state.ts` hold no integration-specific knowledge. See
+[Adding a new integration](#adding-a-new-integration) below.
+
+Each integration runs inside its own `try`/`catch`, so one integration
+failing (an expired Strava token, a WakaTime outage) never blocks the
+others. After every run, each integration's outcome — success, error, or
+"needs re-auth" — is written to a per-integration status record in the
+`STATE` KV namespace, readable via `GET /status`.
 
 Habitify's log API only appends, so writing a value twice would double-count
 it. To make hourly reruns idempotent, every write is an upsert: delete
@@ -88,46 +96,31 @@ the same hour with the same source data converges to the same result.
 
 ## Connecting each service
 
-**WakaTime** — grab your API key from
-[wakatime.com/settings/api-key](https://wakatime.com/settings/api-key) and
-set it as `WAKATIME_API_KEY`.
+Each integration's own README documents where to get its secrets and any
+one-time setup steps (OAuth consent, callback domains, and the like):
 
-**Strava** — create an API application at
-[strava.com/settings/api](https://www.strava.com/settings/api). Set its
-**Authorization Callback Domain** to the worker's own domain (e.g.
-`habitify-sync.<your-subdomain>.workers.dev`, or your custom domain if you've
-mapped one). Then, once `STRAVA_CLIENT_ID`/`STRAVA_CLIENT_SECRET` are set and
-the worker is deployed, open:
-
-```
-https://<worker-url>/strava/authorize?token=<ADMIN_TOKEN>
-```
-
-in a browser and approve the consent screen. This is a one-time step — the
-resulting refresh token is stored in the `STATE` KV namespace. Strava rotates
-the refresh token every time it's used, so the worker automatically persists
-the new one back to KV after every refresh; you never need to repeat this
-step unless Strava revokes access.
+- **[Strava setup](src/integrations/strava/README.md#setup)**
+- **[WakaTime setup](src/integrations/wakatime/README.md#setup)**
 
 ## HTTP API
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `POST /sync` (optional `?source=strava\|wakatime`) | Bearer token | Force a sync of all sources, or just one |
-| `GET /status` | Bearer token | Last run outcome per source |
-| `GET /strava/authorize` | Bearer token **or** `?token=` query param | Start the one-time Strava OAuth flow |
-| `GET /strava/callback` | None (validated by OAuth `state` param) | Finishes the OAuth exchange; Strava redirects here |
+| `POST /sync` (optional `?source=strava\|wakatime`) | `admin` | Force a sync of all integrations, or just one |
+| `GET /status` | `admin` | Last run outcome per integration |
+| `GET /strava/authorize` | `admin-or-query-token` | Start the one-time Strava OAuth flow ([details](src/integrations/strava/README.md#routes)) |
+| `GET /strava/callback` | `public` | Finishes the Strava OAuth exchange ([details](src/integrations/strava/README.md#routes)) |
 
-Every route requires `Authorization: Bearer <ADMIN_TOKEN>` **except**
-`GET /strava/callback`, which is called directly by Strava's redirect (it
-can't attach a header) and is instead validated against a one-time `state`
-value stored in KV during `/strava/authorize`.
+Every route requires `Authorization: Bearer <ADMIN_TOKEN>` **except** routes
+declared `public` (currently only `GET /strava/callback`, called directly by
+Strava's redirect, which can't attach a header — it's instead validated
+against a one-time `state` value stored in KV).
 
-The `?token=` query-string fallback works **only** on `GET /strava/authorize`,
-because that route is meant to be opened directly in a browser, where an
-`Authorization` header can't be attached. It is deliberately not honored
-anywhere else — query strings leak into access logs, proxy logs, and browser
-history, so every other route requires the header.
+The `?token=` query-string fallback is honored only on routes declared
+`admin-or-query-token` — meant for routes opened directly in a browser,
+where an `Authorization` header can't be attached. It is deliberately not
+honored on plain `admin` routes: query strings leak into access logs, proxy
+logs, and browser history.
 
 Examples:
 
@@ -144,39 +137,38 @@ curl "https://<worker-url>/status" \
 
 ## Adding a new integration
 
-The `Source` interface is the extension point (`src/sources/types.ts`):
+The `Integration` interface is the extension point
+(`src/integrations/types.ts`):
 
 ```ts
-export interface Source {
+export interface Integration {
   name: string;
   enabled(env: Env): boolean;
   fetchToday(context: SourceContext): Promise<HabitValue[]>;
+  routes?: IntegrationRoute[];
 }
 ```
 
-There are two recipes, and they are not the same size.
+Adding or removing an integration means adding or removing its directory
+plus one registry line — the same recipe whether it's a plain key-based
+integration or one with its own OAuth routes and KV state:
 
-**Simple key-based source** (an API-key integration like WakaTime):
-
-- [ ] New file in `src/sources/` implementing `Source`
-- [ ] One entry added to `SOURCES` in `src/sources/registry.ts`
-- [ ] Its secret/config keys added to `Env` in `src/sources/types.ts`
+- [ ] New directory `src/integrations/<name>/` with an `index.ts`
+      implementing `Integration` (add a `routes` array only if it needs
+      HTTP endpoints of its own — an OAuth authorize/callback pair, say —
+      and declare any KV keys it owns right there in the same file)
+- [ ] One entry added to `INTEGRATIONS` in `src/integrations/registry.ts`
+- [ ] Its secret/config keys added to `Env` in `src/integrations/types.ts`
 - [ ] Those keys added to `.dev.vars.example` (with dummy values)
-- [ ] A `HABIT_ID_<SOURCE>` var added to `wrangler.toml`
-- [ ] A test modeled on `test/sources/wakatime.test.ts`
+- [ ] A `HABIT_ID_<NAME>` var added to `wrangler.toml`
+- [ ] Colocated tests in `src/integrations/<name>/index.test.ts`
+- [ ] A `README.md` in the same directory, following the six-section
+      structure the existing integrations use (what it logs, configuration,
+      setup, routes, stored state, gotchas)
 
-**OAuth source** (like Strava) — everything above, plus:
-
-- [ ] An authorize route in `src/index.ts` (redirects to the provider's
-      consent screen, stashes a CSRF `state` value in KV)
-- [ ] A callback route in `src/index.ts` (validates `state`, exchanges the
-      code, persists tokens)
-- [ ] Token storage and shape added to `src/state.ts`
-
-Strava's implementation touches all of those files (`src/index.ts`,
-`src/state.ts`, `src/sources/types.ts`, `src/sources/strava.ts`,
-`src/sources/registry.ts`, `wrangler.toml`, `.dev.vars.example`), so an OAuth
-integration is **not** a one-file change — budget for it accordingly.
+No other file needs to change — `src/index.ts` builds its route table from
+`INTEGRATIONS` plus its own core routes, and it, `src/state.ts`, and
+`src/sync.ts` hold no integration-specific knowledge.
 
 ## Operational notes / gotchas
 
@@ -186,41 +178,29 @@ integration is **not** a one-file change — budget for it accordingly.
 
 - **Timezone.** `TIMEZONE` (default `Europe/Berlin`) defines what "today"
   means for the worker — it's used both to pick the day boundary for Strava
-  activities and as the target date when writing to Habitify. WakaTime,
-  however, resolves its own `start`/`end` query dates using whatever
-  timezone is set on your WakaTime account, independent of the worker's
-  `TIMEZONE`. If the two don't match, values will be off near midnight in
-  either zone. Set your WakaTime account timezone to match `TIMEZONE`.
-
-- **Strava callback domain.** Strava allows exactly one Authorization
-  Callback Domain per API application. Run `/strava/authorize` from the
-  exact host you registered — a `*.workers.dev` host and a custom domain
-  mapped to the same worker are not interchangeable. Using the wrong one
-  produces an opaque error from Strava, not a helpful one from this worker.
+  activities and as the target date when writing to Habitify. See each
+  integration's README for how it handles (or doesn't handle) its own
+  timezone — WakaTime in particular resolves `start`/`end` using its own
+  account timezone, independent of this var.
 
 - **`GET /status` is the only failure signal.** There are no notifications
-  of any kind. A source that needs re-authorization (e.g. Strava refused a
-  refresh token) reports `"state": "auth_needed"`. Other failures report
-  `"state": "error"` with a `lastError` message. A source whose required
-  secrets aren't set reports `"state": "disabled"`.
+  of any kind. An integration that needs re-authorization (e.g. Strava
+  refused a refresh token) reports `"state": "auth_needed"`. Other failures
+  report `"state": "error"` with a `lastError` message. An integration whose
+  required secrets aren't set reports `"state": "disabled"`.
 
 - **The upsert isn't atomic.** If the DELETE of today's logs succeeds but
   the following POST fails, today's value is left empty in Habitify until
   the next hourly run repairs it.
 
 - **Resetting wedged credentials.** There is no HTTP route to clear stored
-  tokens. If Strava auth gets stuck, delete the stored tokens directly and
-  re-run the authorize flow:
+  tokens. Each integration's README documents its own KV keys and the
+  `wrangler kv key delete` command to clear them (see, e.g.,
+  [Strava's stored state](src/integrations/strava/README.md#stored-state)).
 
-  ```bash
-  npx wrangler kv key delete --namespace-id=<id> "strava:tokens"
-  ```
-
-  Then open `/strava/authorize` again.
-
-- **Missing `HABITIFY_API_KEY`.** Every source reports `"state": "error"`
-  with the message `"HABITIFY_API_KEY is not configured"` rather than
-  failing silently or retrying forever.
+- **Missing `HABITIFY_API_KEY`.** Every integration reports
+  `"state": "error"` with the message `"HABITIFY_API_KEY is not configured"`
+  rather than failing silently or retrying forever.
 
 - **Dev-only npm advisories.** `npm audit` reports high-severity advisories
   in the `wrangler`/Miniflare dev toolchain (devDependencies only). The
