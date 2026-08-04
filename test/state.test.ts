@@ -4,8 +4,8 @@ import { readJson, STATE_KEYS, writeJson } from "../src/state";
 
 describe("state helpers", () => {
   it("round-trips JSON values through KV", async () => {
-    await writeJson(env.STATE, STATE_KEYS.stravaTokens, { accessToken: "a", refreshToken: "r", expiresAt: 1 });
-    const tokens = await readJson<{ accessToken: string }>(env.STATE, STATE_KEYS.stravaTokens);
+    await writeJson(env.STATE, "test:key", { accessToken: "a", refreshToken: "r", expiresAt: 1 });
+    const tokens = await readJson<{ accessToken: string }>(env.STATE, "test:key");
     expect(tokens?.accessToken).toBe("a");
   });
 
