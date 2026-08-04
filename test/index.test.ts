@@ -30,6 +30,17 @@ describe("authentication", () => {
   });
 });
 
+describe("POST /sync", () => {
+  it("returns 404 naming the valid sources when ?source= matches none registered", async () => {
+    const response = await request("/sync?source=kindle", { method: "POST", headers: bearer });
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("kindle");
+    expect(body.error).toContain("strava");
+    expect(body.error).toContain("wakatime");
+  });
+});
+
 describe("GET /status", () => {
   it("returns stored status for a source no longer in the registry", async () => {
     await writeJson(env.STATE, STATE_KEYS.sourceStatus("kindle"), { state: "ok" } satisfies SourceStatus);

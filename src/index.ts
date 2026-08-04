@@ -80,8 +80,18 @@ export async function handleFetch(request: Request, env: Env, fetchFn: typeof fe
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   switch (route) {
-    case "POST /sync":
-      return Response.json(await runSync(env, SOURCES, new Date(), fetchFn, url.searchParams.get("source") ?? undefined));
+    case "POST /sync": {
+      const sourceParam = url.searchParams.get("source") ?? undefined;
+      if (sourceParam && !SOURCES.some((source) => source.name === sourceParam)) {
+        return Response.json(
+          {
+            error: `unknown source "${sourceParam}"; valid sources: ${SOURCES.map((source) => source.name).join(", ")}`,
+          },
+          { status: 404 },
+        );
+      }
+      return Response.json(await runSync(env, SOURCES, new Date(), fetchFn, sourceParam));
+    }
     case "GET /status":
       return handleStatus(env);
     case "GET /strava/authorize":
