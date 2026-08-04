@@ -78,7 +78,10 @@ fallback is recorded per-source and visible in `GET /status`.
    its `unit` must be one of Habitify's own unit symbols (see
    `HABITIFY_UNIT_SYMBOLS` in `src/habitify.ts`) — notably there is **no**
    `pages` unit, so a page-counting habit (e.g. for Kindle) should use `rep`
-   instead.
+   instead. If Habitify's response body to the creation itself can't be
+   parsed, the worker confirms the write by re-reading the habit list instead
+   of reporting a failure, so a `POST /habits` error should still be checked
+   against `GET /habits` before retrying.
 
    Find your Habitify habit ids and fill them into `wrangler.toml`
    (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`). Before the

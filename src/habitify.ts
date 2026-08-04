@@ -206,11 +206,35 @@ export class HabitifyClient {
     if (!response.ok) {
       throw new Error(`Habitify POST /habits failed with status ${response.status}: ${await response.text()}`);
     }
-    const created = parseHabitSummary(await response.json());
-    if (!created) {
-      throw new Error("Habitify POST /habits succeeded but returned an unusable habit object");
+
+    const responseBody = (await response.json()) as unknown;
+    const direct = parseHabitSummary(responseBody);
+    if (direct) return direct;
+
+    // The 201 body's shape isn't confirmed to match a GET /habits list entry — it may be wrapped
+    // one level under `data`. Try that unwrap before giving up on parsing the response directly.
+    if (typeof responseBody === "object" && responseBody !== null && "data" in responseBody) {
+      const unwrapped = parseHabitSummary((responseBody as Record<string, unknown>).data);
+      if (unwrapped) return unwrapped;
     }
-    return created;
+
+    // The write already succeeded at this point — Habitify created the habit, it just returned a
+    // body this client can't parse (a bare confirmation message, a shape missing goals, etc.).
+    // Creating a habit is NOT idempotent: throwing here would report a successful write as a
+    // failure and invite the caller to retry, which would create a duplicate habit. So instead of
+    // throwing, fall back to re-reading the habit list and matching by the name just requested.
+    const habits = await this.listHabits();
+    const matchesByName = habits.filter((habit) => habit.name === input.name);
+    if (matchesByName.length > 0) {
+      // A newly created habit is the most recently added one, i.e. the last match in list order.
+      return matchesByName[matchesByName.length - 1];
+    }
+
+    throw new Error(
+      `Habitify POST /habits succeeded (status ${response.status}) but its response body could not be parsed, ` +
+        `and no habit named "${input.name}" was found via GET /habits. The habit was probably created despite ` +
+        `this error — check GET /habits before retrying, since retrying risks creating a duplicate habit.`,
+    );
   }
 
   // Habitify v2 has no range-delete endpoint for logs (only per-log DELETE by id, and there's no

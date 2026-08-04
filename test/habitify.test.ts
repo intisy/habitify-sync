@@ -288,6 +288,98 @@ describe("HabitifyClient.createHabit", () => {
     await expect(client.createHabit({ name: "Read" })).rejects.toThrow("Habitify POST /habits failed with status 422");
   });
 
+  it("parses a { data: {...} } wrapped 201 body via the unwrap path", async () => {
+    const fetchFn = (async () =>
+      new Response(
+        JSON.stringify({ data: { id: "habit-wrapped", name: "Read", goals: [{ unit: "rep" }] } }),
+        { status: 201 },
+      )) as typeof fetch;
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    const created = await client.createHabit({ name: "Read" });
+    expect(created).toEqual({ id: "habit-wrapped", name: "Read", unit: "rep" });
+  });
+
+  it("falls back to listHabits when the 201 body can't be parsed, returning the habit matching the requested name", async () => {
+    const recorded: RecordedRequest[] = [];
+    let callCount = 0;
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      callCount++;
+      const headers = new Headers(init?.headers);
+      recorded.push({
+        method: init?.method ?? "GET",
+        url: String(input),
+        body: init?.body === undefined ? undefined : String(init.body),
+        apiKey: headers.get("X-API-Key"),
+        authorization: headers.get("Authorization"),
+      });
+      if (callCount === 1) {
+        // The unparseable 201 body: a bare confirmation message, no id anywhere.
+        return new Response(JSON.stringify({ message: "Habit created successfully" }), { status: 201 });
+      }
+      return new Response(
+        JSON.stringify({
+          data: [
+            { id: "habit-a", name: "Other habit", goals: [] },
+            { id: "habit-b", name: "Pages read", goals: [{ unit: "rep" }] },
+          ],
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    const created = await client.createHabit({ name: "Pages read" });
+
+    expect(created).toEqual({ id: "habit-b", name: "Pages read", unit: "rep" });
+    expect(recorded).toHaveLength(2);
+    expect(recorded[0].method).toBe("POST");
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits");
+    expect(recorded[1].method).toBe("GET");
+    expect(recorded[1].url).toBe("https://habitify.example/v2/habits");
+  });
+
+  it("returns the last match, in list order, when several habits share the requested name", async () => {
+    let callCount = 0;
+    const fetchFn = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ message: "created" }), { status: 201 });
+      }
+      return new Response(
+        JSON.stringify({
+          data: [
+            { id: "habit-first", name: "Pages read", goals: [] },
+            { id: "habit-second", name: "Pages read", goals: [] },
+            { id: "habit-third", name: "Pages read", goals: [] },
+          ],
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    const created = await client.createHabit({ name: "Pages read" });
+    expect(created.id).toBe("habit-third");
+  });
+
+  it("throws mentioning the habit was probably created when the fallback lookup finds no match, making no further requests after that", async () => {
+    let callCount = 0;
+    const fetchFn = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ message: "created" }), { status: 201 });
+      }
+      return new Response(
+        JSON.stringify({ data: [{ id: "habit-x", name: "Something else entirely", goals: [] }] }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    await expect(client.createHabit({ name: "Pages read" })).rejects.toThrow(
+      /probably created[\s\S]*GET \/habits/,
+    );
+    // Exactly the create POST and the fallback GET — no retry of either.
+    expect(callCount).toBe(2);
+  });
+
   it("rejects an empty name before making any request", async () => {
     const recorded: RecordedRequest[] = [];
     const client = new HabitifyClient("api-key", recordingFetch(recorded, 201), "https://habitify.example/v2");

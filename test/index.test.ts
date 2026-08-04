@@ -199,6 +199,47 @@ describe("POST /habits", () => {
     expect(body.error).toContain("500");
     expect(JSON.stringify(body)).not.toContain("habitify-key");
   });
+
+  it("returns 201 with the created HabitSummary when the 201 body is wrapped in { data: {...} }", async () => {
+    const fetchFn = (async () =>
+      Response.json({ data: { id: "habit-new", name: "Pages read", goals: [{ unit: "rep" }] } }, { status: 201 })) as typeof fetch;
+    const response = await postHabits({ name: "Pages read" }, fetchFn);
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as unknown;
+    expect(body).toEqual({ id: "habit-new", name: "Pages read", unit: "rep" });
+  });
+
+  it("returns 201 with the habit found via the listHabits fallback when the 201 body can't be parsed", async () => {
+    let callCount = 0;
+    const fetchFn = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return Response.json({ message: "Habit created successfully" }, { status: 201 });
+      }
+      return Response.json({ data: [{ id: "habit-new", name: "Pages read", goals: [{ unit: "rep" }] }] }, { status: 200 });
+    }) as typeof fetch;
+    const response = await postHabits({ name: "Pages read" }, fetchFn);
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as unknown;
+    expect(body).toEqual({ id: "habit-new", name: "Pages read", unit: "rep" });
+    expect(callCount).toBe(2);
+  });
+
+  it("returns 502 mentioning the habit was probably created when the fallback lookup also finds nothing", async () => {
+    let callCount = 0;
+    const fetchFn = (async () => {
+      callCount++;
+      if (callCount === 1) {
+        return Response.json({ message: "Habit created successfully" }, { status: 201 });
+      }
+      return Response.json({ data: [] }, { status: 200 });
+    }) as typeof fetch;
+    const response = await postHabits({ name: "Pages read" }, fetchFn);
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("probably created");
+    expect(callCount).toBe(2);
+  });
 });
 
 describe("scheduled", () => {
