@@ -12,6 +12,16 @@ const GET_DEVICE_TOKEN_URL = "https://read.amazon.com/service/web/register/getDe
 const LIBRARY_URL = "https://read.amazon.com/kindle-library/search";
 const START_READING_URL = "https://read.amazon.com/service/mobile/reader/startReading";
 const WORD_COUNT_URL = "https://read.amazon.com/renderer/wordCount";
+const PRODUCT_PAGE_URL = "https://www.amazon.com/dp";
+
+// A negative page-count lookup (Amazon blocked the request, or the page had no parseable print
+// length) is retried at most once per day, rather than on every hourly sync, so a book that
+// genuinely has no discoverable print length doesn't cost a product-page fetch every run.
+const PAGE_COUNT_NEGATIVE_CACHE_TTL_SECONDS = 86400;
+
+// A printed page count that would obviously be a mis-parse (e.g. picking up a stray number from
+// unrelated page markup) rather than a real book's print length.
+const MAX_PLAUSIBLE_PRINTED_PAGE_COUNT = 100000;
 
 // The Kindle Cloud Reader's own device identity, verified live against a real account. It is a
 // constant for every account and every book — NOT a per-user value — so it is used as both the
@@ -37,6 +47,10 @@ export const KINDLE_STATE_KEYS = {
   // Keyed by asin AND contentVersion: a new revision (Amazon reflowing the book) is simply a
   // different key, so the cache is invalidated by construction rather than by comparison.
   totalWords: (asin: string, contentVersion: string) => `kindle:totalWords:${asin}:${contentVersion}`,
+  // Keyed by asin ONLY, unlike totalWords: a printed page count is a property of the print
+  // edition, not of a specific Kindle content revision, so it never needs to be re-derived when
+  // Amazon reflows the ebook.
+  pageCount: (asin: string) => `kindle:pageCount:${asin}`,
 };
 
 export interface KindleSession {
@@ -98,6 +112,11 @@ interface BookReading {
 // (no baseline yet, or the position hasn't advanced), not that wordCount was tried and failed.
 type PageDerivation = "print-pages" | "words-per-page" | "positions-fallback" | "not-measured";
 
+// Where a book's printed page count (the print-pages tier's exact divisor) came from, if any was
+// found at all. "none" covers both "never looked up" (book didn't contribute this sync) and
+// "looked up and nothing usable was found" (cached negative, a failed fetch, or unparseable HTML).
+type PageCountSource = "override" | "lookup" | "none";
+
 // Diagnostic, per-book progress — carried on the returned HabitValue's `diagnostics` field purely
 // so GET /status is useful for a human to sanity-check; not used in any math here, and never sent
 // to Habitify (see the comment above the POST body in habitify.ts).
@@ -108,6 +127,7 @@ interface KindleBookDiagnostic {
   wordsRead: number;
   derivation: PageDerivation;
   pages: number;
+  pageCountSource: PageCountSource;
 }
 
 // Amazon's own JavaScript promotes the session-id cookie to this request header for the ADP-gated
@@ -244,11 +264,14 @@ async function fetchWordCount(
   }
 }
 
-// KINDLE_PAGE_COUNTS maps asin -> printed page count, letting the exact print-pages derivation
-// run for books the operator has configured. Parsed defensively: invalid JSON, a non-object body
-// (e.g. an array), or an individual entry that isn't a positive finite number is dropped —
-// per-entry for the bad-value case, entirely for a malformed top-level body — so a typo degrades
-// that book (or every book) to the words-per-page estimate rather than throwing.
+// KINDLE_PAGE_COUNTS maps asin -> printed page count. It is an OPTIONAL OVERRIDE, not the primary
+// mechanism: printed page counts are normally discovered automatically from each book's Amazon
+// product page (see resolvePageCount below). This map exists only to rescue a book for which that
+// discovery fails (e.g. Amazon blocks the Worker's product-page request), so it requires no
+// day-to-day maintenance. Parsed defensively: invalid JSON, a non-object body (e.g. an array), or
+// an individual entry that isn't a positive finite number is dropped — per-entry for the bad-value
+// case, entirely for a malformed top-level body — so a typo degrades that book (or every book) to
+// the dynamic lookup (or, failing that, the words-per-page estimate) rather than throwing.
 function parsePageCounts(raw: string | undefined): Record<string, number> {
   if (!raw) return {};
   let parsed: unknown;
@@ -267,6 +290,104 @@ function parsePageCounts(raw: string | undefined): Record<string, number> {
     }
   }
   return result;
+}
+
+// KINDLE_PAGE_COUNTS entries are keyed by asin only (see parsePageCounts above); the same asin
+// keying is used for the dynamic lookup's cache below, since a printed page count belongs to the
+// print edition, not to any one Kindle content revision.
+
+// Cached in KV per asin. `pages: number` is a confirmed printed page count, cached permanently —
+// it cannot change. `pages: null` is a negative marker: the lookup was already attempted and
+// found nothing (blocked, non-2xx, or unparseable), cached with a short TTL so it's retried at
+// most once a day rather than on every hourly sync. Wrapping the number in an object (rather than
+// storing it bare) is what lets a cached negative (`{ pages: null }`) be told apart from "never
+// looked up at all" (no KV entry, so `readJson` returns `null` for the whole entry).
+interface PageCountCacheEntry {
+  pages: number | null;
+}
+
+// Ordered, most-specific-first: Amazon's English product pages label the field "Print length";
+// German-locale pages use "Seitenzahl der Print-Ausgabe" for the same field; a handful of pages
+// carry it instead (or additionally) as a "numberOfPages" JSON/attribute value. The first pattern
+// to match a plausible value wins.
+const PRINTED_PAGE_COUNT_PATTERNS: RegExp[] = [
+  /Print length[:\s]*([0-9,]+)\s*pages/i,
+  /Seitenzahl der Print-Ausgabe[:\s]*([0-9,]+)\s*Seiten/i,
+  /"numberOfPages"\s*:\s*"?([0-9,]+)/i,
+];
+
+// Extracts a printed page count from a book's Amazon product-page HTML, trying each label variant
+// in turn and rejecting anything that isn't a plausible positive page count (a stray "0", a
+// non-numeric capture, or an absurdly large number that's more likely a mis-parse than a real
+// print length) rather than trusting the first regex match blindly.
+function parsePrintedPageCount(html: string): number | null {
+  for (const pattern of PRINTED_PAGE_COUNT_PATTERNS) {
+    const match = html.match(pattern);
+    if (!match) continue;
+    const value = Number(match[1].replace(/,/g, ""));
+    if (Number.isInteger(value) && value > 0 && value <= MAX_PLAUSIBLE_PRINTED_PAGE_COUNT) {
+      return value;
+    }
+  }
+  return null;
+}
+
+// Fetches the book's public Amazon product page to discover its printed page count. Deliberately
+// sends NO Cookie header: this is a public page that doesn't need (or want) the Amazon session —
+// sending it would needlessly expose the captured session to an endpoint that works fine without
+// it, and would make the response vary per-session instead of being a plain, cacheable public
+// page. Only a browser User-Agent and Accept-Language are sent, matching a logged-out browser.
+async function fetchPageCountFromProductPage(asin: string, fetchFn: typeof fetch): Promise<number | null> {
+  try {
+    const response = await fetchFn(`${PRODUCT_PAGE_URL}/${encodeURIComponent(asin)}`, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    if (!response.ok) return null;
+    return parsePrintedPageCount(await response.text());
+  } catch {
+    return null;
+  }
+}
+
+// Resolves a book's printed page count, most exact first: an operator-supplied
+// KINDLE_PAGE_COUNTS override (rescuing books Amazon blocks the Worker's own request for), else
+// the cached or freshly-discovered product-page value. The override short-circuits before ever
+// touching the cache or making a request, since it exists specifically to bypass the lookup.
+async function resolvePageCount(
+  asin: string,
+  overridePageCount: number | undefined,
+  kv: KVNamespace,
+  fetchFn: typeof fetch,
+): Promise<{ pageCount: number | undefined; source: PageCountSource }> {
+  if (overridePageCount !== undefined) {
+    return { pageCount: overridePageCount, source: "override" };
+  }
+
+  const cacheKey = KINDLE_STATE_KEYS.pageCount(asin);
+  const cached = await readJson<PageCountCacheEntry>(kv, cacheKey);
+  if (cached !== null) {
+    return cached.pages !== null
+      ? { pageCount: cached.pages, source: "lookup" }
+      : { pageCount: undefined, source: "none" };
+  }
+
+  const discovered = await fetchPageCountFromProductPage(asin, fetchFn);
+  if (discovered !== null) {
+    // Permanent: a printed page count doesn't change, so there's no reason to ever re-fetch it.
+    await writeJson(kv, cacheKey, { pages: discovered } satisfies PageCountCacheEntry);
+    return { pageCount: discovered, source: "lookup" };
+  }
+
+  // Negative marker, short-lived: see the rationale on PageCountCacheEntry and
+  // PAGE_COUNT_NEGATIVE_CACHE_TTL_SECONDS above.
+  await kv.put(cacheKey, JSON.stringify({ pages: null } satisfies PageCountCacheEntry), {
+    expirationTtl: PAGE_COUNT_NEGATIVE_CACHE_TTL_SECONDS,
+  });
+  return { pageCount: undefined, source: "none" };
 }
 
 // Fetches a book's whole-book word count (the exact denominator for the print-pages derivation),
@@ -295,6 +416,7 @@ interface PageDerivationResult {
   pages: number;
   wordsRead: number;
   derivation: PageDerivation;
+  pageCountSource: PageCountSource;
 }
 
 // The waterfall for one book's page contribution since its baseline, most exact first. Every tier
@@ -306,7 +428,7 @@ async function derivePagesSinceBaseline(
   baselinePosition: number,
   currentPosition: number,
   reading: BookReading,
-  printPageCount: number | undefined,
+  overridePageCount: number | undefined,
   wordsPerPage: number,
   positionsPerPage: number,
   cookie: string,
@@ -318,6 +440,9 @@ async function derivePagesSinceBaseline(
     pages: Math.max(0, (currentPosition - baselinePosition) / positionsPerPage),
     wordsRead: 0,
     derivation: "positions-fallback",
+    // Never attempted: a page-count lookup is only worth spending on a book whose wordCount call
+    // actually succeeded (see the efficiency note below), which never happened on this path.
+    pageCountSource: "none",
   });
 
   if (!reading.contentVersion || !reading.renderingToken) {
@@ -341,16 +466,20 @@ async function derivePagesSinceBaseline(
     return positionsFallback();
   }
 
-  if (printPageCount !== undefined) {
+  // Only reached once wordsRead is known good — this is the one book this sync that actually
+  // contributed, so it's the only one worth the cost of a page-count lookup (cached or not).
+  const { pageCount, source } = await resolvePageCount(asin, overridePageCount, kv, fetchFn);
+
+  if (pageCount !== undefined) {
     const totalWords = await getTotalWordsInBook(asin, contentVersion, renderingToken, cookie, sessionId, kv, fetchFn);
     if (totalWords !== null && totalWords > 0) {
-      return { pages: (wordsRead / totalWords) * printPageCount, wordsRead, derivation: "print-pages" };
+      return { pages: (wordsRead / totalWords) * pageCount, wordsRead, derivation: "print-pages", pageCountSource: source };
     }
     // totalWordsInBook unavailable (fetch failed, or degenerately 0) — fall through to the
     // words-per-page estimate below, still using the wordsRead already fetched.
   }
 
-  return { pages: wordsRead / wordsPerPage, wordsRead, derivation: "words-per-page" };
+  return { pages: wordsRead / wordsPerPage, wordsRead, derivation: "words-per-page", pageCountSource: source };
 }
 
 // metadataUrl returns JSONP — a bare function-call wrapper around the JSON body, e.g.
@@ -497,6 +626,9 @@ export const kindleIntegration: Integration = {
       let pages = 0;
       let wordsRead = 0;
       let derivation: PageDerivation = "not-measured";
+      // "none" until proven otherwise: a book that never reaches the lookup (not-measured, or a
+      // wordCount failure) never had a page count sourced from anywhere.
+      let pageCountSource: PageCountSource = "none";
 
       if (baselinePosition === undefined) {
         // First time seen this local day: record the baseline now so the NEXT sync measures
@@ -528,6 +660,7 @@ export const kindleIntegration: Integration = {
           pages = result.pages;
           wordsRead = result.wordsRead;
           derivation = result.derivation;
+          pageCountSource = result.pageCountSource;
         } catch {
           // Defense in depth: derivePagesSinceBaseline's own steps already degrade internally on
           // failure, but an unexpected throw still must not fail the whole sync. This book WAS
@@ -540,7 +673,15 @@ export const kindleIntegration: Integration = {
       }
 
       if (book.progress !== null) {
-        bookDiagnostics.push({ asin, title: book.title, progress: book.progress, wordsRead, derivation, pages });
+        bookDiagnostics.push({
+          asin,
+          title: book.title,
+          progress: book.progress,
+          wordsRead,
+          derivation,
+          pages,
+          pageCountSource,
+        });
       }
     }
 
