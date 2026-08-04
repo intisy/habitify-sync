@@ -1,104 +1,102 @@
 import { readJson, STATE_KEYS, type SourceStatus } from "./state";
-import { SOURCES } from "./sources/registry";
-import { exchangeStravaCode } from "./sources/strava";
-import type { Env } from "./sources/types";
+import { INTEGRATIONS } from "./integrations/registry";
+import type { AuthMode, Env, IntegrationRoute, RouteContext } from "./integrations/types";
 import { runSync } from "./sync";
 
-const STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize";
-
-// Query-param auth is scoped to the Strava authorize route only (it's opened directly in a
-// browser, so it can't attach an Authorization header); every other route requires the header,
-// since query strings leak into access logs, proxy logs, and browser history.
-function isAuthorized(request: Request, env: Env, allowQueryToken: boolean): boolean {
+// Query-param auth is honored only for routes declared "admin-or-query-token" (currently just
+// Strava's authorize route: it's opened directly in a browser, so it can't attach an
+// Authorization header). Every other route requires the header, since query strings leak into
+// access logs, proxy logs, and browser history.
+function isAuthorized(request: Request, env: Env, auth: AuthMode): boolean {
   const headerToken = request.headers.get("Authorization")?.replace(/^Bearer /, "");
-  const queryToken = allowQueryToken ? new URL(request.url).searchParams.get("token") : null;
+  const queryToken = auth === "admin-or-query-token" ? new URL(request.url).searchParams.get("token") : null;
   const token = headerToken ?? queryToken;
   return Boolean(env.ADMIN_TOKEN) && token === env.ADMIN_TOKEN;
 }
 
 async function handleStatus(env: Env): Promise<Response> {
   const statuses: Record<string, SourceStatus | null> = {};
-  for (const source of SOURCES) {
-    statuses[source.name] = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
+  for (const integration of INTEGRATIONS) {
+    statuses[integration.name] = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(integration.name));
   }
-  // Keys can outlive their source when an integration is removed from the registry; surface those too.
+  // Keys can outlive their integration when it's removed from the registry; surface those too.
   const prefix = STATE_KEYS.sourceStatus("");
   const stored = await env.STATE.list({ prefix });
   for (const key of stored.keys) {
-    const sourceName = key.name.slice(prefix.length);
-    if (!(sourceName in statuses)) {
-      statuses[sourceName] = await readJson<SourceStatus>(env.STATE, key.name);
+    const name = key.name.slice(prefix.length);
+    if (!(name in statuses)) {
+      statuses[name] = await readJson<SourceStatus>(env.STATE, key.name);
     }
   }
   return Response.json(statuses);
 }
 
-async function handleStravaAuthorize(request: Request, env: Env): Promise<Response> {
-  if (!env.STRAVA_CLIENT_ID) {
-    return Response.json({ error: "STRAVA_CLIENT_ID is not configured" }, { status: 500 });
+async function handleSync(request: Request, context: RouteContext): Promise<Response> {
+  const url = new URL(request.url);
+  const sourceParam = url.searchParams.get("source") ?? undefined;
+  if (sourceParam && !INTEGRATIONS.some((integration) => integration.name === sourceParam)) {
+    return Response.json(
+      {
+        error: `unknown source "${sourceParam}"; valid sources: ${INTEGRATIONS.map((integration) => integration.name).join(", ")}`,
+      },
+      { status: 404 },
+    );
   }
-  const state = crypto.randomUUID();
-  await env.STATE.put(STATE_KEYS.stravaOauthState, state, { expirationTtl: 600 });
-  const redirect = new URL(STRAVA_AUTHORIZE_URL);
-  redirect.searchParams.set("client_id", env.STRAVA_CLIENT_ID);
-  redirect.searchParams.set("redirect_uri", `${new URL(request.url).origin}/strava/callback`);
-  redirect.searchParams.set("response_type", "code");
-  redirect.searchParams.set("scope", "activity:read_all");
-  redirect.searchParams.set("state", state);
-  return Response.redirect(redirect.toString(), 302);
+  return Response.json(await runSync(context.env, INTEGRATIONS, new Date(), context.fetchFn, sourceParam));
 }
 
-async function handleStravaCallback(request: Request, env: Env, fetchFn: typeof fetch): Promise<Response> {
-  const url = new URL(request.url);
-  const expectedState = await env.STATE.get(STATE_KEYS.stravaOauthState);
-  if (!expectedState || url.searchParams.get("state") !== expectedState) {
-    return Response.json({ error: "state mismatch; restart at /strava/authorize" }, { status: 403 });
+const CORE_ROUTES: IntegrationRoute[] = [
+  { method: "POST", path: "/sync", auth: "admin", handler: handleSync },
+  { method: "GET", path: "/status", auth: "admin", handler: (_request, context) => handleStatus(context.env) },
+];
+
+// Builds a lookup table keyed by "METHOD path" from a flat list of routes (core routes plus
+// every route each integration contributes). Exported so tests can prove duplicate detection
+// and generic dispatch behavior using routes that don't belong to any real integration.
+export function buildRouteTable(routes: IntegrationRoute[]): Map<string, IntegrationRoute> {
+  const table = new Map<string, IntegrationRoute>();
+  for (const route of routes) {
+    const key = `${route.method} ${route.path}`;
+    if (table.has(key)) {
+      throw new Error(`Duplicate route registration: ${key}`);
+    }
+    table.set(key, route);
   }
-  const code = url.searchParams.get("code");
-  if (!code) {
-    return Response.json({ error: "missing code parameter" }, { status: 400 });
-  }
-  try {
-    await exchangeStravaCode(env, fetchFn, code);
-  } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 502 });
-  }
-  await env.STATE.delete(STATE_KEYS.stravaOauthState);
-  return new Response("Strava connected. You can close this tab.", { status: 200 });
+  return table;
 }
+
+export async function dispatch(
+  routeTable: Map<string, IntegrationRoute>,
+  request: Request,
+  env: Env,
+  fetchFn: typeof fetch,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const route = routeTable.get(`${request.method} ${url.pathname}`);
+  if (route?.auth === "public") {
+    return route.handler(request, { env, fetchFn });
+  }
+  // A route that isn't registered is treated as requiring the strictest auth (bearer token
+  // only, no query fallback), so probing for routes without a token gets the same 401 a real
+  // admin route would, rather than a bare 404 leaking which paths exist.
+  if (!isAuthorized(request, env, route?.auth ?? "admin")) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  if (!route) {
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+  return route.handler(request, { env, fetchFn });
+}
+
+const ROUTE_TABLE = buildRouteTable([
+  ...CORE_ROUTES,
+  ...INTEGRATIONS.flatMap((integration) => integration.routes ?? []),
+]);
 
 // Takes an injectable fetchFn (defaulted to the global fetch) so tests can exercise the Strava
 // code exchange and /sync route without hitting the network.
 export async function handleFetch(request: Request, env: Env, fetchFn: typeof fetch = fetch): Promise<Response> {
-  const url = new URL(request.url);
-  const route = `${request.method} ${url.pathname}`;
-
-  if (route === "GET /strava/callback") {
-    return handleStravaCallback(request, env, fetchFn);
-  }
-  if (!isAuthorized(request, env, route === "GET /strava/authorize")) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
-  }
-  switch (route) {
-    case "POST /sync": {
-      const sourceParam = url.searchParams.get("source") ?? undefined;
-      if (sourceParam && !SOURCES.some((source) => source.name === sourceParam)) {
-        return Response.json(
-          {
-            error: `unknown source "${sourceParam}"; valid sources: ${SOURCES.map((source) => source.name).join(", ")}`,
-          },
-          { status: 404 },
-        );
-      }
-      return Response.json(await runSync(env, SOURCES, new Date(), fetchFn, sourceParam));
-    }
-    case "GET /status":
-      return handleStatus(env);
-    case "GET /strava/authorize":
-      return handleStravaAuthorize(request, env);
-    default:
-      return Response.json({ error: "not found" }, { status: 404 });
-  }
+  return dispatch(ROUTE_TABLE, request, env, fetchFn);
 }
 
 export default {
@@ -110,7 +108,7 @@ export default {
     // Awaiting directly (instead of context.waitUntil) means a thrown error surfaces to
     // Cloudflare's cron failure reporting rather than being silently swallowed.
     try {
-      await runSync(env, SOURCES, new Date());
+      await runSync(env, INTEGRATIONS, new Date());
     } catch (error) {
       console.error("habitify-sync scheduled run failed:", error);
     }

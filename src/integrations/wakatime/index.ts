@@ -1,10 +1,10 @@
-import type { Env, HabitValue, Source, SourceContext } from "./types";
+import type { Env, HabitValue, Integration, SourceContext } from "../types";
 
 interface WakatimeSummaries {
   data: { grand_total: { total_seconds: number } }[];
 }
 
-export const wakatimeSource: Source = {
+export const wakatimeIntegration: Integration = {
   name: "wakatime",
 
   enabled(env: Env): boolean {

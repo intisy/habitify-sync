@@ -1,9 +1,29 @@
-import { readJson, STATE_KEYS, writeJson, type StravaTokens } from "../state";
-import { localMidnightEpochSeconds } from "../time";
-import { AuthNeededError, type Env, type HabitValue, type Source, type SourceContext } from "./types";
+import { readJson, writeJson } from "../../state";
+import { localMidnightEpochSeconds } from "../../time";
+import {
+  AuthNeededError,
+  type Env,
+  type HabitValue,
+  type Integration,
+  type RouteContext,
+  type SourceContext,
+} from "../types";
 
-export const STRAVA_TOKEN_URL = "https://www.strava.com/api/v3/oauth/token";
+const STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize";
+const STRAVA_TOKEN_URL = "https://www.strava.com/api/v3/oauth/token";
 const STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities";
+
+// This integration's own KV keys — not shared generic state.
+export const STRAVA_STATE_KEYS = {
+  tokens: "strava:tokens",
+  oauthState: "strava:oauth_state",
+};
+
+export interface StravaTokens {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+}
 
 interface StravaTokenResponse {
   access_token: string;
@@ -45,7 +65,7 @@ async function refreshTokens(env: Env, fetchFn: typeof fetch, tokens: StravaToke
     throw new Error(`Strava token refresh failed with status ${response.status}`);
   }
   const refreshed = mapTokenResponse((await response.json()) as StravaTokenResponse);
-  await writeJson(env.STATE, STATE_KEYS.stravaTokens, refreshed);
+  await writeJson(env.STATE, STRAVA_STATE_KEYS.tokens, refreshed);
   return refreshed;
 }
 
@@ -57,11 +77,47 @@ export async function exchangeStravaCode(env: Env, fetchFn: typeof fetch, code: 
     throw new Error(`Strava code exchange failed with status ${response.status}`);
   }
   const tokens = mapTokenResponse((await response.json()) as StravaTokenResponse);
-  await writeJson(env.STATE, STATE_KEYS.stravaTokens, tokens);
+  await writeJson(env.STATE, STRAVA_STATE_KEYS.tokens, tokens);
   return tokens;
 }
 
-export const stravaSource: Source = {
+async function handleAuthorize(request: Request, context: RouteContext): Promise<Response> {
+  const { env } = context;
+  if (!env.STRAVA_CLIENT_ID) {
+    return Response.json({ error: "STRAVA_CLIENT_ID is not configured" }, { status: 500 });
+  }
+  const state = crypto.randomUUID();
+  await env.STATE.put(STRAVA_STATE_KEYS.oauthState, state, { expirationTtl: 600 });
+  const redirect = new URL(STRAVA_AUTHORIZE_URL);
+  redirect.searchParams.set("client_id", env.STRAVA_CLIENT_ID);
+  redirect.searchParams.set("redirect_uri", `${new URL(request.url).origin}/strava/callback`);
+  redirect.searchParams.set("response_type", "code");
+  redirect.searchParams.set("scope", "activity:read_all");
+  redirect.searchParams.set("state", state);
+  return Response.redirect(redirect.toString(), 302);
+}
+
+async function handleCallback(request: Request, context: RouteContext): Promise<Response> {
+  const { env, fetchFn } = context;
+  const url = new URL(request.url);
+  const expectedState = await env.STATE.get(STRAVA_STATE_KEYS.oauthState);
+  if (!expectedState || url.searchParams.get("state") !== expectedState) {
+    return Response.json({ error: "state mismatch; restart at /strava/authorize" }, { status: 403 });
+  }
+  const code = url.searchParams.get("code");
+  if (!code) {
+    return Response.json({ error: "missing code parameter" }, { status: 400 });
+  }
+  try {
+    await exchangeStravaCode(env, fetchFn, code);
+  } catch (error) {
+    return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 502 });
+  }
+  await env.STATE.delete(STRAVA_STATE_KEYS.oauthState);
+  return new Response("Strava connected. You can close this tab.", { status: 200 });
+}
+
+export const stravaIntegration: Integration = {
   name: "strava",
 
   enabled(env: Env): boolean {
@@ -70,7 +126,7 @@ export const stravaSource: Source = {
 
   async fetchToday(context: SourceContext): Promise<HabitValue[]> {
     const { env, timeZone, now, fetchFn } = context;
-    let tokens = await readJson<StravaTokens>(env.STATE, STATE_KEYS.stravaTokens);
+    let tokens = await readJson<StravaTokens>(env.STATE, STRAVA_STATE_KEYS.tokens);
     if (!tokens) {
       throw new AuthNeededError("Strava is not authorized yet; open /strava/authorize");
     }
@@ -95,4 +151,9 @@ export const stravaSource: Source = {
     const totalSeconds = activities.reduce((sum, activity) => sum + activity.moving_time, 0);
     return [{ habitId: env.HABIT_ID_STRAVA!, value: Math.round(totalSeconds / 60), unit: "min" }];
   },
+
+  routes: [
+    { method: "GET", path: "/strava/authorize", auth: "admin-or-query-token", handler: handleAuthorize },
+    { method: "GET", path: "/strava/callback", auth: "public", handler: handleCallback },
+  ],
 };

@@ -1,16 +1,8 @@
-import type { HabitValue } from "./sources/types";
+import type { HabitValue } from "./integrations/types";
 
 export const STATE_KEYS = {
-  stravaTokens: "strava:tokens",
-  stravaOauthState: "strava:oauth_state",
   sourceStatus: (sourceName: string) => `status:${sourceName}`,
 };
-
-export interface StravaTokens {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-}
 
 export interface SourceStatus {
   state: "ok" | "error" | "auth_needed" | "disabled";

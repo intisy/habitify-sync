@@ -1,4 +1,4 @@
-import type { HabitValue } from "./sources/types";
+import type { HabitValue } from "./integrations/types";
 import { isoDayRange } from "./time";
 
 const HABITIFY_BASE_URL = "https://api.habitify.me";

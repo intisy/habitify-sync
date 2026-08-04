@@ -1,6 +1,6 @@
 import { HabitifyClient } from "./habitify";
 import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "./state";
-import { AuthNeededError, type Env, type Source, type SourceContext } from "./sources/types";
+import { AuthNeededError, type Env, type Integration, type SourceContext } from "./integrations/types";
 import { todayInTimeZone } from "./time";
 
 const DEFAULT_TIME_ZONE = "Europe/Berlin";
@@ -12,7 +12,7 @@ export interface SyncResult {
 
 export async function runSync(
   env: Env,
-  sources: Source[],
+  sources: Integration[],
   now: Date,
   fetchFn: typeof fetch = fetch,
   onlySource?: string,

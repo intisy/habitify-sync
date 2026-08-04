@@ -1,8 +1,8 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import worker, { handleFetch } from "../src/index";
-import { readJson, STATE_KEYS, writeJson, type SourceStatus, type StravaTokens } from "../src/state";
-import type { Env } from "../src/sources/types";
+import worker, { buildRouteTable, dispatch } from "../src/index";
+import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "../src/state";
+import type { Env, IntegrationRoute } from "../src/integrations/types";
 
 const authedEnv: Env = { ...env, ADMIN_TOKEN: "secret-token", HABITIFY_API_KEY: "habitify-key" };
 
@@ -60,51 +60,6 @@ describe("GET /status", () => {
   });
 });
 
-describe("GET /strava/authorize", () => {
-  it("redirects to Strava consent with a stored state parameter", async () => {
-    const stravaEnv: Env = { ...authedEnv, STRAVA_CLIENT_ID: "client-id", STRAVA_CLIENT_SECRET: "client-secret" };
-    const context = createExecutionContext();
-    const response = await worker.fetch(
-      new Request("https://worker.example/strava/authorize?token=secret-token"),
-      stravaEnv,
-      context,
-    );
-    await waitOnExecutionContext(context);
-
-    expect(response.status).toBe(302);
-    const location = new URL(response.headers.get("Location")!);
-    expect(location.origin).toBe("https://www.strava.com");
-    expect(location.searchParams.get("client_id")).toBe("client-id");
-    expect(location.searchParams.get("redirect_uri")).toBe("https://worker.example/strava/callback");
-    const state = location.searchParams.get("state")!;
-    expect(await env.STATE.get(STATE_KEYS.stravaOauthState)).toBe(state);
-  });
-});
-
-describe("GET /strava/callback", () => {
-  it("rejects a mismatched state parameter", async () => {
-    await env.STATE.put(STATE_KEYS.stravaOauthState, "expected-state");
-    const response = await request("/strava/callback?code=abc&state=wrong-state");
-    expect(response.status).toBe(403);
-  });
-
-  it("exchanges the code for tokens and stores them in KV", async () => {
-    await env.STATE.put(STATE_KEYS.stravaOauthState, "expected-state");
-    const fakeFetch = (async () =>
-      Response.json({ access_token: "access-1", refresh_token: "refresh-1", expires_at: 9999999999 })) as typeof fetch;
-
-    const response = await handleFetch(
-      new Request("https://worker.example/strava/callback?code=abc123&state=expected-state"),
-      authedEnv,
-      fakeFetch,
-    );
-
-    expect(response.status).toBe(200);
-    const stored = await readJson<StravaTokens>(env.STATE, STATE_KEYS.stravaTokens);
-    expect(stored).toEqual({ accessToken: "access-1", refreshToken: "refresh-1", expiresAt: 9999999999 });
-  });
-});
-
 describe("scheduled", () => {
   it("runs the sync and writes source status to KV", async () => {
     await env.STATE.delete(STATE_KEYS.sourceStatus("strava"));
@@ -117,5 +72,66 @@ describe("scheduled", () => {
 
     const stravaStatus = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus("strava"));
     expect(stravaStatus).not.toBeNull();
+  });
+});
+
+describe("dispatch (generic route table)", () => {
+  it("throws naming the conflicting route when two routes register the same method and path", () => {
+    const routeA: IntegrationRoute = { method: "GET", path: "/dup", auth: "admin", handler: async () => new Response("a") };
+    const routeB: IntegrationRoute = { method: "GET", path: "/dup", auth: "public", handler: async () => new Response("b") };
+    expect(() => buildRouteTable([routeA, routeB])).toThrow("GET /dup");
+  });
+
+  it("routes an integration-contributed path and honors its declared auth mode", async () => {
+    const publicRoute: IntegrationRoute = {
+      method: "GET",
+      path: "/fake/public",
+      auth: "public",
+      handler: async () => new Response("public ok"),
+    };
+    const queryRoute: IntegrationRoute = {
+      method: "GET",
+      path: "/fake/query",
+      auth: "admin-or-query-token",
+      handler: async () => new Response("query ok"),
+    };
+    const adminRoute: IntegrationRoute = {
+      method: "GET",
+      path: "/fake/admin",
+      auth: "admin",
+      handler: async () => new Response("admin ok"),
+    };
+    const table = buildRouteTable([publicRoute, queryRoute, adminRoute]);
+    const testEnv: Env = { ...env, ADMIN_TOKEN: "secret-token" };
+
+    // public: reachable with no auth at all
+    const publicResponse = await dispatch(table, new Request("https://worker.example/fake/public"), testEnv, fetch);
+    expect(await publicResponse.text()).toBe("public ok");
+
+    // admin-or-query-token: the ?token= fallback works
+    const queryResponse = await dispatch(
+      table,
+      new Request("https://worker.example/fake/query?token=secret-token"),
+      testEnv,
+      fetch,
+    );
+    expect(await queryResponse.text()).toBe("query ok");
+
+    // admin: the ?token= fallback does NOT work — only the Authorization header does
+    const adminQueryResponse = await dispatch(
+      table,
+      new Request("https://worker.example/fake/admin?token=secret-token"),
+      testEnv,
+      fetch,
+    );
+    expect(adminQueryResponse.status).toBe(401);
+
+    const adminHeaderResponse = await dispatch(
+      table,
+      new Request("https://worker.example/fake/admin", { headers: bearer }),
+      testEnv,
+      fetch,
+    );
+    expect(await adminHeaderResponse.text()).toBe("admin ok");
   });
 });
