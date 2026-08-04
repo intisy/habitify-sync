@@ -131,3 +131,39 @@ describe("HabitifyClient.listHabits", () => {
     await expect(client.listHabits()).rejects.toThrow("Habitify GET /habits failed with status 401");
   });
 });
+
+// A plain vi.fn() mock is indifferent to its `this` binding, so it can't reproduce workerd's
+// behavior: calling the native fetch with a `this` that isn't the global scope throws "Illegal
+// invocation". These tests instead use a real, non-arrow `function` that records whatever `this`
+// it was invoked with. If HabitifyClient ever regresses to calling `this.fetchFn(...)` (a
+// property access, which makes the HabitifyClient instance the call's receiver), `this` inside the
+// stub would be that instance. Called correctly — as a detached plain function — strict-mode ES
+// modules give an unbound call `this === undefined`, which is what these tests assert.
+describe("HabitifyClient fetchFn this-binding", () => {
+  const now = new Date("2026-08-04T10:00:00Z");
+
+  function makeThisRecordingFetch(responseBody: unknown): { fetchFn: typeof fetch; getRecordedThis: () => unknown } {
+    let recordedThis: unknown = "fetchFn was never called";
+    function thisRecordingFetch(this: unknown): Promise<Response> {
+      recordedThis = this;
+      return Promise.resolve(new Response(JSON.stringify(responseBody), { status: 200 }));
+    }
+    return { fetchFn: thisRecordingFetch as unknown as typeof fetch, getRecordedThis: () => recordedThis };
+  }
+
+  it("invokes fetchFn with this === undefined in upsertTodayLog, not the HabitifyClient instance", async () => {
+    const { fetchFn, getRecordedThis } = makeThisRecordingFetch({});
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example");
+    await client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now);
+    expect(getRecordedThis()).toBeUndefined();
+    expect(getRecordedThis()).not.toBe(client);
+  });
+
+  it("invokes fetchFn with this === undefined in listHabits, not the HabitifyClient instance", async () => {
+    const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ data: [] });
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example");
+    await client.listHabits();
+    expect(getRecordedThis()).toBeUndefined();
+    expect(getRecordedThis()).not.toBe(client);
+  });
+});
