@@ -134,12 +134,33 @@ others. After every run, each integration's outcome — success, error, or
 `STATE` KV namespace, readable via `GET /status`.
 
 Habitify's log API only appends, so writing a value twice would double-count
-it. To make hourly reruns idempotent, every write is an upsert: undo today's
-existing logs for the habit (Habitify v2 has no range-delete for logs, only
-per-log delete by id with no way to list log ids, so `POST .../logs/undo` is
-the primitive instead — see [Operational notes](#operational-notes--gotchas)),
-then post the current total. Rerunning the same hour with the same source
-data converges to the same result.
+it. To make hourly reruns idempotent without double-counting, every write is
+a **convergence by difference**: once per run (not once per habit) the
+worker reads `GET /habits/journal` for today and notes what Habitify already
+holds for each habit (`progress.current`). For each value, it computes
+`difference = target - current` and posts that difference — positive or
+negative — instead of the total. Because logs accumulate, posting the
+difference converges the habit to exactly `target`. If the difference is
+effectively zero (within a small epsilon), **no request is made at all** —
+a quiet hour costs zero writes. A habit that doesn't appear in today's
+journal is treated as holding `0`, so its full target is posted.
+
+This replaced an earlier "undo today's logs, then post the total" upsert.
+That approach depended on `POST /habits/{habitId}/logs/undo`, which the
+OpenAPI spec describes as clearing every log entry for a habit on a given
+date — but on the live worker it was observed to return 200 while changing
+nothing for measurable logs, silently inflating every habit's value on
+every hourly sync. Convergence-by-difference doesn't call that endpoint at
+all in the normal case: Habitify's log schema declares no minimum on a
+log's `value`, so a negative difference is posted directly to bring an
+over-counted value back down. `POST .../logs/undo` is retained only as a
+best-effort **fallback** for the rare case where Habitify rejects a
+negative post outright (any 4xx): the worker calls undo, then posts the
+full target, and records in `GET /status` that the fallback path was used
+— since undo may still do nothing, in which case the next run's difference
+simply corrects it again. See
+[Operational notes](#operational-notes--gotchas) for what this means for
+manual edits.
 
 Habitify only accepts logs against its own closed set of unit symbols (see
 `HABITIFY_UNIT_SYMBOLS` in `src/habitify.ts`), which doesn't include every
@@ -436,10 +457,15 @@ variables → Actions** in your fork.
 
 ## Operational notes / gotchas
 
-- **The worker owns its habits.** Every sync undoes today's existing logs
-  for a habit (`POST /habits/{habitId}/logs/undo`) before posting the new
-  total. Any manual entry you add for today in the Habitify app will be
-  wiped on the next hourly run.
+- **The worker converges its habits toward the synced value.** Every sync
+  reads what Habitify already holds for today (`GET /habits/journal`) and
+  posts only the difference to reach the source's true value — see
+  [How it works](#how-it-works). This is a behavior change worth stating
+  plainly: **a manual entry you add for today in the Habitify app is no
+  longer wiped** the way it was under the old undo-then-post-total upsert;
+  instead it is **corrected back toward the synced value** on the next
+  hourly run, since the worker only knows the source's total and Habitify's
+  current total, not which part of that total was a manual entry.
 
 - **Habitify API v2.** The worker talks to `https://api.habitify.me/v2`
   using an `X-API-Key` header (the retired v1 API used
@@ -469,9 +495,20 @@ variables → Actions** in your fork.
   report `"state": "error"` with a `lastError` message. An integration whose
   required secrets aren't set reports `"state": "disabled"`.
 
-- **The upsert isn't atomic.** If the undo of today's logs succeeds but
-  the following POST fails, today's value is left empty in Habitify until
-  the next hourly run repairs it.
+- **A failed journal read blocks writes for that run, on purpose.** The
+  worker needs to know what Habitify currently holds before it can compute a
+  safe difference to post. If `GET /habits/journal` fails, nothing is
+  written for any source that run — falling back to posting the full total
+  is exactly the accumulation bug convergence-by-difference replaced. Each
+  affected source reports `"state": "error"` with a `lastError` naming the
+  journal failure; a missed hour self-corrects the next time the journal
+  read succeeds.
+
+- **The negative-post fallback isn't atomic.** If Habitify rejects a
+  negative-difference post and the fallback's `logs/undo` call succeeds but
+  the following full-total POST fails, today's value is left at whatever
+  undo left it (likely unchanged, since undo was observed to be a no-op for
+  measurable logs) until the next hourly run repairs it.
 
 - **Resetting wedged credentials.** There is no HTTP route to clear stored
   tokens. Each integration's README documents its own KV keys and the
