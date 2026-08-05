@@ -10,6 +10,34 @@ manually and checking status. It currently ships four integrations:
 - **[Kindle](src/integrations/kindle/README.md)** — pages read, derived from Amazon's own word-count endpoint (exact using a printed page count discovered automatically from the book's Amazon product page, otherwise a words-per-page estimate)
 - **[keybr](src/integrations/keybr/README.md)** — minutes of active typing time practiced today, parsed from keybr.com's own unauthenticated practice-history endpoint
 
+## Forking this
+
+This is a personal deployment, in daily use by its owner. The committed
+`wrangler.toml` intentionally holds the **maintainer's own real deployment
+values** — a real KV namespace id and real Habitify habit ids — rather than
+placeholders. None of that is a secret: it's useless to anyone without the
+maintainer's Cloudflare account and Habitify API key, so committing it costs
+nothing and gives you a concrete, working example to read instead of a wall
+of placeholder text.
+
+If you fork this repo to run your own copy, replace the following before you
+deploy:
+
+| What | Replace with |
+|---|---|
+| The `[[kv_namespaces]]` `id` in `wrangler.toml` | Your own namespace: `npx wrangler kv namespace create STATE` |
+| Every `HABIT_ID_*` var in `wrangler.toml` (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`, `HABIT_ID_KEYBR`) | Your own Habitify habit ids — once your own worker is deployed, `GET /habits` on it; or directly, `curl -H "X-API-Key: <your Habitify API key>" https://api.habitify.me/v2/habits` |
+| `KEYBR_PUBLIC_ID` in `wrangler.toml` | The id from your own `https://www.keybr.com/profile/{id}` |
+| `TIMEZONE` in `wrangler.toml` | Your own IANA timezone (the committed default, `Europe/Berlin`, is the maintainer's) |
+| The five secrets — `HABITIFY_API_KEY`, `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `WAKATIME_API_KEY`, `ADMIN_TOKEN` | Your own values, each set with `wrangler secret put <NAME>` — see [Setup](#setup) step 5 |
+
+`npm run preflight` catches most of a missed replacement — an empty or
+invalid `TIMEZONE`, malformed `KINDLE_PAGE_COUNTS` JSON, an integration
+that's half-configured (a habit id set without its other required vars, or
+vice versa) — before it becomes a rejected deploy or a silently `"disabled"`
+source. It cannot check the five secrets, since those live only in
+Cloudflare, never in a file preflight can read.
+
 ## How it works
 
 Each integration implements the `Integration` interface (see
@@ -59,17 +87,19 @@ fallback is recorded per-source and visible in `GET /status`.
    npm install
    ```
 
-2. Create the KV namespace used for tokens and sync status, and paste the
-   returned `id` into `wrangler.toml`:
+2. `wrangler.toml` as committed in this repo holds the **maintainer's own**
+   deployment values — a real KV namespace id and real Habitify habit ids,
+   not placeholders (see [Forking this](#forking-this) for why that's safe
+   to commit). If you're forking this repo rather than just reading it,
+   create your own KV namespace and paste the returned `id` into
+   `wrangler.toml` in place of the maintainer's:
 
    ```bash
    npx wrangler kv namespace create STATE
    ```
 
-   The `id` committed in `wrangler.toml` (`0000000000000000000000000000000000000000`)
-   is a placeholder. **It must be replaced with the real namespace id before
-   the first deploy** — the worker will not read or write state correctly
-   otherwise.
+   The worker will not read or write state correctly until this points at a
+   namespace in your own Cloudflare account.
 
 3. Each integration needs a Habitify habit to log into. Create one either in
    the Habitify app itself, or — once the worker is deployed and
@@ -221,9 +251,27 @@ integration or one with its own OAuth routes and KV state:
       HTTP endpoints of its own — an OAuth authorize/callback pair, say —
       and declare any KV keys it owns right there in the same file)
 - [ ] One entry added to `INTEGRATIONS` in `src/integrations/registry.ts`
-- [ ] Its secret/config keys added to `Env` in `src/integrations/types.ts`
-- [ ] Those keys added to `.dev.vars.example` (with dummy values)
-- [ ] A `HABIT_ID_<NAME>` var added to `wrangler.toml`
+- [ ] **Every** field it reads off `env` — its `HABIT_ID_<NAME>` included,
+      not just an integration-specific var like `KEYBR_PUBLIC_ID` — added to
+      the `Env` interface in `src/integrations/types.ts`. It's easy to add
+      the var to `wrangler.toml` and forget `Env`; `env.HABIT_ID_<NAME>`
+      simply won't compile until it's there.
+- [ ] Its `HABIT_ID_<NAME>` var, and any other plain vars it needs (e.g.
+      `KEYBR_PUBLIC_ID`), added to `wrangler.toml`'s `[vars]`
+- [ ] Any *secret* it needs (set via `wrangler secret put`, never a plain
+      var) added to `.dev.vars.example` with a dummy value, so `npm run dev`
+      has something to read locally. A plain var does **not** go in
+      `.dev.vars.example` — it lives only in `wrangler.toml`, which
+      `wrangler dev` reads directly. keybr needs no secret at all, so it
+      added nothing here.
+- [ ] Registered in the `integrations` list in `scripts/preflight.mjs`
+      (habit-id var, any extra vars it depends on, any secrets), so
+      `npm run preflight` can catch it being half-configured
+- [ ] If it contributes `routes`, a row per route added to this README's
+      [HTTP API](#http-api) table, and a link to its README added everywhere
+      the other integrations are listed (the top of this README and
+      [Connecting each service](#connecting-each-service)) — keybr needed
+      neither, since it has no routes of its own
 - [ ] Colocated tests in `src/integrations/<name>/index.test.ts`
 - [ ] A `README.md` in the same directory, following the six-section
       structure the existing integrations use (what it logs, configuration,
@@ -232,6 +280,54 @@ integration or one with its own OAuth routes and KV state:
 No other file needs to change — `src/index.ts` builds its route table from
 `INTEGRATIONS` plus its own core routes, and it, `src/state.ts`, and
 `src/sync.ts` hold no integration-specific knowledge.
+
+## Continuous integration, monitoring, and deploy
+
+Four pieces of automation live under `.github/`:
+
+- **`npm run preflight`** (`scripts/preflight.mjs`) statically checks
+  `wrangler.toml` before you deploy: that the `STATE` KV `id` is present and
+  isn't the old placeholder, that `TIMEZONE` (if set) is a zone `Intl`
+  recognizes, that `KINDLE_PAGE_COUNTS` (if set) is valid JSON shaped as
+  `{"asin": pages}`, and that each integration has its habit id and every
+  other var it needs set together, rather than half-configured (a habit id
+  with no `KEYBR_PUBLIC_ID`, say). It cannot check secrets — those live only
+  in Cloudflare, never in a file preflight can read.
+- **Check** (`.github/workflows/check.yml`) runs `npm run typecheck`,
+  `npm test`, and `npm run preflight` on every push to `master` and on every
+  pull request. Needs no repository secrets or variables.
+- **Dependabot** (`.github/dependabot.yml`) opens a monthly npm dependency
+  update PR. `wrangler`, `@cloudflare/*`, and `vitest` are grouped into a
+  single PR rather than three, because that trio has broken installs here
+  before with conflicting peer ranges — one PR that CI can prove installs
+  and passes together beats three that each half-satisfy the others.
+- **Monitor** (`.github/workflows/monitor.yml`) calls `GET /status` daily at
+  07:00 UTC and fails the run (which GitHub emails to the repo owner) if any
+  source reports `"error"` or `"auth_needed"` — e.g. after the Kindle cookie
+  or a Strava refresh token expires. `GET /status` is otherwise a pull-only
+  endpoint with no notifications of its own; this turns it into a push. It
+  needs, in your fork's repository settings:
+  - a repository **variable** `WORKER_URL` — your deployed worker's base URL
+  - a repository **secret** `ADMIN_TOKEN` — the same value you set with
+    `wrangler secret put ADMIN_TOKEN`
+
+  If either is missing, the job logs a message and exits successfully
+  instead of failing, so a fork that hasn't wired up monitoring yet doesn't
+  show a false-red workflow.
+- **Deploy** (`.github/workflows/deploy.yml`) runs the typecheck and test
+  suite, then `npx wrangler deploy` — but only on a manual
+  `workflow_dispatch`, triggered from the Actions tab, never on push or on
+  merge to `master`. This worker is somebody's daily habit tracking; a bad
+  merge auto-deploying on push would silently overwrite a live, working
+  worker with no human review gate in between. It needs, in your fork's
+  repository settings:
+  - a repository secret `CLOUDFLARE_API_TOKEN`
+  - a repository secret `CLOUDFLARE_ACCOUNT_ID` (kept as a secret and
+    supplied via the workflow's `env`, rather than committed to
+    `wrangler.toml`, so the account id stays out of a public repository)
+
+Set repository secrets and variables under **Settings → Secrets and
+variables → Actions** in your fork.
 
 ## Operational notes / gotchas
 
@@ -289,8 +385,9 @@ No other file needs to change — `src/index.ts` builds its route table from
 ## Development
 
 ```bash
-npm test         # vitest run, using @cloudflare/vitest-pool-workers with a real KV binding
+npm test          # vitest run, using @cloudflare/vitest-pool-workers with a real KV binding
 npm run typecheck # tsc --noEmit
+npm run preflight # validate wrangler.toml — see Continuous integration, monitoring, and deploy
 npm run dev       # wrangler dev
 npm run deploy    # wrangler deploy
 ```
