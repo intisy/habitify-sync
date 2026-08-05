@@ -1,6 +1,6 @@
 name = "habitify-sync"
 main = "src/index.ts"
-compatibility_date = "2026-01-01"
+compatibility_date = "2026-08-05"
 
 [triggers]
 crons = ["0 * * * *"]
