@@ -9,5 +9,9 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  // Covered by tsconfig.node-scripts.json instead: it needs real Node types (node:fs) rather
+  // than the Workers runtime types every other test file here uses, and the two type sets
+  // declare conflicting ambient globals if mixed in one program.
+  "exclude": ["test/settings-manifest.test.ts"]
 }

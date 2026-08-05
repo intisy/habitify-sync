@@ -1,0 +1,100 @@
+{
+  "strava": [
+    {
+      "key": "clientId",
+      "variableName": "STRAVA_CLIENT_ID",
+      "type": "string",
+      "required": true,
+      "secret": true,
+      "description": "Strava OAuth application client id, from strava.com/settings/api."
+    },
+    {
+      "key": "clientSecret",
+      "variableName": "STRAVA_CLIENT_SECRET",
+      "type": "string",
+      "required": true,
+      "secret": true,
+      "description": "Strava OAuth application client secret, from strava.com/settings/api."
+    },
+    {
+      "key": "habitId",
+      "variableName": "HABIT_ID_STRAVA",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "description": "Habitify habit id this integration logs into."
+    }
+  ],
+  "wakatime": [
+    {
+      "key": "apiKey",
+      "variableName": "WAKATIME_API_KEY",
+      "type": "string",
+      "required": true,
+      "secret": true,
+      "description": "WakaTime API key, from wakatime.com/settings/api-key."
+    },
+    {
+      "key": "habitId",
+      "variableName": "HABIT_ID_WAKATIME",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "description": "Habitify habit id this integration logs into."
+    }
+  ],
+  "kindle": [
+    {
+      "key": "wordsPerPage",
+      "variableName": "KINDLE_WORDS_PER_PAGE",
+      "type": "number",
+      "required": false,
+      "secret": false,
+      "default": "250",
+      "description": "Words per printed page, used only when no printed page count is available at all."
+    },
+    {
+      "key": "pageCounts",
+      "variableName": "KINDLE_PAGE_COUNTS",
+      "type": "json",
+      "required": false,
+      "secret": false,
+      "description": "Optional override mapping asin -> printed page count, for a book whose printed page count Amazon's own product page won't yield."
+    },
+    {
+      "key": "positionsPerPage",
+      "variableName": "KINDLE_POSITIONS_PER_PAGE",
+      "type": "number",
+      "required": false,
+      "secret": false,
+      "default": "1800",
+      "description": "Whispersync positions per printed page, a last-resort fallback when a book's word count is unavailable."
+    },
+    {
+      "key": "habitId",
+      "variableName": "HABIT_ID_KINDLE",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "description": "Habitify habit id this integration logs into."
+    }
+  ],
+  "keybr": [
+    {
+      "key": "publicId",
+      "variableName": "KEYBR_PUBLIC_ID",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "description": "Public profile id from keybr.com/profile/{id}. Not a secret."
+    },
+    {
+      "key": "habitId",
+      "variableName": "HABIT_ID_KEYBR",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "description": "Habitify habit id this integration logs into."
+    }
+  ]
+}

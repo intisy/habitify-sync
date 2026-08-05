@@ -6,13 +6,15 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "vitest run --passWithNoTests",
-    "typecheck": "tsc --noEmit",
-    "preflight": "node scripts/preflight.mjs"
+    "test": "vitest run --passWithNoTests && vitest run --config test/settings-manifest.vitest.config.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node-scripts.json",
+    "preflight": "node scripts/preflight.mjs",
+    "generate:settings-manifest": "vitest run --config scripts/generate-settings-manifest.vitest.config.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.12.0",
     "@cloudflare/workers-types": "^4.20260101.0",
+    "@types/node": "^26.1.2",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0",
     "wrangler": "~4.107.1"
