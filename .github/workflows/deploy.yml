@@ -24,6 +24,22 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+      # Entirely optional: deploying from a developer machine works without any
+      # API token, because `wrangler login` holds an OAuth session there. A
+      # token exists only for CI, which has no browser to log in with. Fail with
+      # a clear message rather than an opaque wrangler auth error.
+      - name: Check deploy credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_API_TOKEN is not set, so CI cannot deploy."
+            echo "Either run 'npm run deploy' locally (no token needed), or create a"
+            echo "token at Cloudflare > My Profile > API Tokens > Edit Cloudflare Workers"
+            echo "and add it with: gh secret set CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+
       - name: Deploy
         run: npx wrangler deploy
         env:

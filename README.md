@@ -319,12 +319,22 @@ Four pieces of automation live under `.github/`:
   `workflow_dispatch`, triggered from the Actions tab, never on push or on
   merge to `master`. This worker is somebody's daily habit tracking; a bad
   merge auto-deploying on push would silently overwrite a live, working
-  worker with no human review gate in between. It needs, in your fork's
-  repository settings:
-  - a repository secret `CLOUDFLARE_API_TOKEN`
+  worker with no human review gate in between.
+
+  This workflow is **entirely optional**. Deploying from your own machine with
+  `npm run deploy` needs no API token at all — `wrangler login` holds an OAuth
+  session locally. A token exists only because a CI runner has no browser to
+  complete that login with. Skip this workflow unless you specifically want to
+  deploy from the Actions tab; the worker and every other workflow are
+  unaffected. If you do want it, add in your fork's repository settings:
+  - a repository secret `CLOUDFLARE_API_TOKEN` (Cloudflare → My Profile → API
+    Tokens → **Edit Cloudflare Workers** template)
   - a repository secret `CLOUDFLARE_ACCOUNT_ID` (kept as a secret and
     supplied via the workflow's `env`, rather than committed to
     `wrangler.toml`, so the account id stays out of a public repository)
+
+  Without the token the workflow stops at a preflight step with a message
+  saying exactly this, rather than failing on an opaque Wrangler auth error.
 
 Set repository secrets and variables under **Settings → Secrets and
 variables → Actions** in your fork.
