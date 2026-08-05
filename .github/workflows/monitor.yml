@@ -1,0 +1,47 @@
+name: Monitor
+
+# GET /status is the only failure signal this worker has — nothing pushes a
+# notification when a source starts failing. This job turns that pull-only
+# endpoint into one: it fails (and so emails the repo owner) when any source
+# reports "error" or "auth_needed", e.g. after Amazon cookies expire.
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check sync status
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          if [ -z "$WORKER_URL" ] || [ -z "$ADMIN_TOKEN" ]; then
+            echo "WORKER_URL variable or ADMIN_TOKEN secret is not configured; skipping."
+            exit 0
+          fi
+
+          # Cache-busting query param: responses set Cache-Control: no-store,
+          # but a stale intermediary should never make a monitor report health.
+          status_body=$(curl -sS --fail-with-body \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            "$WORKER_URL/status?monitor=$GITHUB_RUN_ID")
+
+          echo "$status_body" | jq .
+
+          unhealthy=$(echo "$status_body" | jq -r '
+            to_entries
+            | map(select(.value != null and (.value.state == "error" or .value.state == "auth_needed")))
+            | map("\(.key): \(.value.state) — \(.value.lastError // "no message")")
+            | join("\n")
+          ')
+
+          if [ -n "$unhealthy" ]; then
+            echo "::error::Unhealthy sources:"
+            echo "$unhealthy"
+            exit 1
+          fi
+
+          echo "All configured sources are healthy."

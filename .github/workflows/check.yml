@@ -1,0 +1,30 @@
+name: Check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # Catches misconfiguration that would otherwise only surface as a failed
+      # deploy or a "disabled"/"error" source at the next hourly sync.
+      - name: Preflight
+        run: npm run preflight

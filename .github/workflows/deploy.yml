@@ -1,0 +1,33 @@
+name: Deploy
+
+# Deliberately manual. Deploy-on-push would overwrite a live, working worker
+# with no review gate, and this worker is somebody's daily habit tracking —
+# a bad merge should not silently take it down. Trigger from the Actions tab
+# once a change has been reviewed.
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Never ship a version that does not pass its own checks.
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Deploy
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Supplied via env rather than committed to wrangler.toml so the
+          # account id stays out of a public repository.
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
