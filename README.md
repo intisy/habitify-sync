@@ -3,11 +3,12 @@
 A Cloudflare Worker that runs on an hourly cron, reads today's totals from
 connected services, and writes them into matching [Habitify](https://habitify.me)
 habits. It also exposes a small authenticated HTTP API for triggering a sync
-manually and checking status. It currently ships three integrations:
+manually and checking status. It currently ships four integrations:
 
 - **[Strava](src/integrations/strava/README.md)** — activity minutes
 - **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes
 - **[Kindle](src/integrations/kindle/README.md)** — pages read, derived from Amazon's own word-count endpoint (exact using a printed page count discovered automatically from the book's Amazon product page, otherwise a words-per-page estimate)
+- **[keybr](src/integrations/keybr/README.md)** — minutes of active typing time practiced today, parsed from keybr.com's own unauthenticated practice-history endpoint
 
 ## How it works
 
@@ -84,8 +85,9 @@ fallback is recorded per-source and visible in `GET /status`.
    against `GET /habits` before retrying.
 
    Find your Habitify habit ids and fill them into `wrangler.toml`
-   (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`). Before the
-   first deploy, the only option is a direct call using your
+   (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`,
+   `HABIT_ID_KEYBR`). Before the first deploy, the only option is a direct
+   call using your
    `HABITIFY_API_KEY` locally (requires a paid Habitify subscription — the
    API is not available on the free plan):
 
@@ -106,7 +108,11 @@ fallback is recorded per-source and visible in `GET /status`.
    — the worker discovers each habit's own configured unit automatically and
    prefers it (see [How it works](#how-it-works)). Leave `HABIT_ID_KINDLE`
    blank to leave that integration disabled — see its README for the
-   one-time Amazon cookie capture it needs instead.
+   one-time Amazon cookie capture it needs instead. Leave `HABIT_ID_KEYBR`
+   or `KEYBR_PUBLIC_ID` blank to leave the keybr integration disabled;
+   neither is a secret, so both live in `wrangler.toml`'s `[vars]` — see
+   [its README](src/integrations/keybr/README.md#setup) for where to find
+   the public id.
 
 4. Local development: copy `.dev.vars.example` to `.dev.vars` (already
    gitignored) and fill in real values, then:
@@ -146,12 +152,13 @@ one-time setup steps (OAuth consent, callback domains, and the like):
 - **[Strava setup](src/integrations/strava/README.md#setup)**
 - **[WakaTime setup](src/integrations/wakatime/README.md#setup)**
 - **[Kindle setup](src/integrations/kindle/README.md#setup)**
+- **[keybr setup](src/integrations/keybr/README.md#setup)**
 
 ## HTTP API
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `POST /sync` (optional `?source=strava\|wakatime\|kindle`) | `admin` | Force a sync of all integrations, or just one |
+| `POST /sync` (optional `?source=strava\|wakatime\|kindle\|keybr`) | `admin` | Force a sync of all integrations, or just one |
 | `GET /status` | `admin` | Last run outcome per integration |
 | `GET /habits` | `admin` | List Habitify habit ids/names/units, for filling into `wrangler.toml` |
 | `GET /habits?raw=1` | `admin` | Same route, untrimmed — full Habitify habit objects (scheduling, area, time-of-day, archived flag, etc.), for diagnosing what Habitify actually stores versus what the app displays |
