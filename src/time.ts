@@ -7,7 +7,7 @@ export function todayInTimeZone(timeZone: string, now: Date): string {
   }).format(now);
 }
 
-export function timeZoneOffsetMinutes(timeZone: string, at: Date): number {
+function timeZoneOffsetMinutes(timeZone: string, at: Date): number {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone,
     hour12: false,
@@ -42,22 +42,4 @@ export function localMidnightEpochSeconds(timeZone: string, now: Date): number {
   const utcMidnightMs = Date.parse(`${today}T00:00:00Z`);
   const offsetMinutes = offsetMinutesAtLocalTime(timeZone, `${today}T00:00:00`);
   return utcMidnightMs / 1000 - offsetMinutes * 60;
-}
-
-function offsetSuffix(offsetMinutes: number): string {
-  const sign = offsetMinutes < 0 ? "-" : "+";
-  const absolute = Math.abs(offsetMinutes);
-  const hours = String(Math.floor(absolute / 60)).padStart(2, "0");
-  const minutes = String(absolute % 60).padStart(2, "0");
-  return `${sign}${hours}:${minutes}`;
-}
-
-export function isoDayRange(timeZone: string, now: Date): { start: string; end: string } {
-  const today = todayInTimeZone(timeZone, now);
-  const startSuffix = offsetSuffix(offsetMinutesAtLocalTime(timeZone, `${today}T00:00:00`));
-  const endSuffix = offsetSuffix(offsetMinutesAtLocalTime(timeZone, `${today}T23:59:59`));
-  return {
-    start: `${today}T00:00:00${startSuffix}`,
-    end: `${today}T23:59:59${endSuffix}`,
-  };
 }
