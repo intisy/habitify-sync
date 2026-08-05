@@ -21,10 +21,10 @@ KINDLE_WORDS_PER_PAGE = "250"
 # Worker's request) — JSON object mapping asin -> printed page count, e.g.
 # {"B009ZUZ9FW":272,"B013UWFM52":304}. See src/integrations/kindle/README.md.
 KINDLE_PAGE_COUNTS = ""
-HABIT_ID_KEYBR = ""
+HABIT_ID_KEYBR = "-OzGmPwwBGyf6PnSAevC"
 # NOT a secret: this is the public profile id from https://www.keybr.com/profile/{id}, safe to
 # commit here rather than as a wrangler secret. See src/integrations/keybr/README.md.
-KEYBR_PUBLIC_ID = ""
+KEYBR_PUBLIC_ID = "b23mgn5"
 
 [[kv_namespaces]]
 binding = "STATE"
