@@ -338,7 +338,12 @@ describe("GET /config", () => {
   });
 
   it("lists every registered integration, redacting secrets to a configured boolean", async () => {
-    const response = await request("/config", { headers: bearer });
+    // A real, distinctive secret value, set here specifically so the assertion below actually
+    // proves redaction — asserting a string's absence means nothing if that string was never
+    // configured in the first place.
+    const DISTINCTIVE_SECRET = "distinctive-strava-client-secret-do-not-leak";
+    const envWithSecret: Env = { ...authedEnv, STRAVA_CLIENT_ID: "client-id", STRAVA_CLIENT_SECRET: DISTINCTIVE_SECRET };
+    const response = await handleFetch(new Request("https://worker.example/config", { headers: bearer }), envWithSecret);
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, { key: string; value?: string; configured?: boolean }[]>;
     expect(Object.keys(body).sort()).toEqual(["keybr", "kindle", "strava", "wakatime"]);
@@ -346,7 +351,10 @@ describe("GET /config", () => {
     const stravaClientId = body.strava.find((setting) => setting.key === "clientId")!;
     expect(stravaClientId).not.toHaveProperty("value");
     expect(typeof stravaClientId.configured).toBe("boolean");
-    expect(JSON.stringify(body)).not.toContain("client-secret");
+    const stravaClientSecret = body.strava.find((setting) => setting.key === "clientSecret")!;
+    expect(stravaClientSecret).not.toHaveProperty("value");
+    expect(stravaClientSecret.configured).toBe(true);
+    expect(JSON.stringify(body)).not.toContain(DISTINCTIVE_SECRET);
 
     const keybrPublicId = body.keybr.find((setting) => setting.key === "publicId")!;
     expect(keybrPublicId).not.toHaveProperty("configured");
