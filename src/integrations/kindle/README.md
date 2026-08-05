@@ -239,6 +239,18 @@ or delete the key directly, then redo the [Setup](#setup) capture.
 - **Cookies expire.** When Amazon rejects the stored cookie (or it's simply
   gone stale), `GET /status` reports `"auth_needed"` — redo the
   [Setup](#setup) capture with a fresh `Cookie` header.
+- **The page-count lookup is hardcoded to Amazon's `.com` marketplace.** It
+  always requests `https://www.amazon.com/dp/<asin>` with
+  `Accept-Language: en-US`, regardless of which Amazon marketplace the
+  account actually belongs to. A Kindle account tied to a non-`.com`
+  marketplace (`amazon.de`, `amazon.co.uk`, and so on) may have ASINs that
+  simply don't resolve at `amazon.com` — the request 404s or serves an
+  unrelated product. Every such book silently degrades to the
+  words-per-page estimate rather than the exact printed-page-count
+  derivation. This is safe and self-healing (it never fails the sync, and
+  the negative cache retries daily in case the ASIN starts resolving), but
+  for an account on a non-`.com` marketplace it means pages may never
+  become "exact" for some or all books.
 - **This endpoint contract is unofficial.** It's confirmed against a live
   account, not documented by Amazon, and may change without notice.
 - **`GET /status` states.** `"disabled"` means `HABIT_ID_KINDLE` isn't set.
