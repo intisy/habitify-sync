@@ -2,6 +2,7 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeEach, describe, expect, it } from "vitest";
 import worker, { handleFetch } from "../../index";
 import { readJson, writeJson } from "../../state";
+import { SettingsResolver } from "../../settings";
 import { AuthNeededError, type Env, type HabitValue, type SourceContext } from "../types";
 import { KINDLE_STATE_KEYS, kindleIntegration, type KindlePositions, type KindleSession } from "./index";
 
@@ -50,8 +51,12 @@ const DEEP_WORK = { asin: "ASINDEEPWORK01", startPosition: 3, endPosition: 45617
 const C_PROGRAMMING_LANGUAGE = { asin: "ASINCPROGLANG1", startPosition: 3, endPosition: 563246, position: 238526 };
 const ESV_BIBLE = { asin: "ASINESVBIBLE01", startPosition: 3, endPosition: 6960680, position: 5238294 };
 
+function makeSettings(testEnv: Env): SettingsResolver {
+  return new SettingsResolver(testEnv, testEnv.STATE, "kindle", kindleIntegration.settings);
+}
+
 function makeContext(testEnv: Env, fetchFn: typeof fetch, today = "2026-08-04"): SourceContext {
-  return { env: testEnv, timeZone: "Europe/Berlin", today, now: new Date(`${today}T10:00:00Z`), fetchFn };
+  return { env: testEnv, timeZone: "Europe/Berlin", today, now: new Date(`${today}T10:00:00Z`), fetchFn, settings: makeSettings(testEnv) };
 }
 
 function kindleEnv(overrides: Partial<Env> = {}): Env {
@@ -82,10 +87,10 @@ beforeEach(async () => {
 });
 
 describe("kindleIntegration.enabled", () => {
-  it("is false without HABIT_ID_KINDLE and true with it", () => {
-    expect(kindleIntegration.enabled({ ...env, HABIT_ID_KINDLE: undefined })).toBe(false);
-    expect(kindleIntegration.enabled({ ...env, HABIT_ID_KINDLE: "" })).toBe(false);
-    expect(kindleIntegration.enabled(kindleEnv())).toBe(true);
+  it("is false without HABIT_ID_KINDLE and true with it", async () => {
+    expect(await makeSettings({ ...env, HABIT_ID_KINDLE: undefined }).isEnabled()).toBe(false);
+    expect(await makeSettings({ ...env, HABIT_ID_KINDLE: "" }).isEnabled()).toBe(false);
+    expect(await makeSettings(kindleEnv()).isEnabled()).toBe(true);
   });
 });
 

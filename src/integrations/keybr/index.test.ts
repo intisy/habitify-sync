@@ -1,10 +1,22 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { keybrIntegration } from "./index";
+import { SettingsResolver } from "../../settings";
 import type { Env, SourceContext } from "../types";
 
+function makeSettings(testEnv: Env): SettingsResolver {
+  return new SettingsResolver(testEnv, testEnv.STATE, "keybr", keybrIntegration.settings);
+}
+
 function makeContext(testEnv: Env, fetchFn: typeof fetch): SourceContext {
-  return { env: testEnv, timeZone: "Europe/Berlin", today: "2026-08-04", now: new Date("2026-08-04T10:00:00Z"), fetchFn };
+  return {
+    env: testEnv,
+    timeZone: "Europe/Berlin",
+    today: "2026-08-04",
+    now: new Date("2026-08-04T10:00:00Z"),
+    fetchFn,
+    settings: makeSettings(testEnv),
+  };
 }
 
 const HEADER_SIGNATURE = 0x4b455942;
@@ -92,11 +104,11 @@ function berlinEpochSeconds(isoUtc: string): number {
 }
 
 describe("keybrIntegration", () => {
-  it("is disabled unless both KEYBR_PUBLIC_ID and HABIT_ID_KEYBR are set", () => {
-    expect(keybrIntegration.enabled({ ...env, KEYBR_PUBLIC_ID: undefined, HABIT_ID_KEYBR: "habit-k" })).toBe(false);
-    expect(keybrIntegration.enabled({ ...env, KEYBR_PUBLIC_ID: "pub-123", HABIT_ID_KEYBR: undefined })).toBe(false);
-    expect(keybrIntegration.enabled({ ...env, KEYBR_PUBLIC_ID: "pub-123", HABIT_ID_KEYBR: "" })).toBe(false);
-    expect(keybrIntegration.enabled({ ...env, KEYBR_PUBLIC_ID: "pub-123", HABIT_ID_KEYBR: "habit-k" })).toBe(true);
+  it("is disabled unless both KEYBR_PUBLIC_ID and HABIT_ID_KEYBR are set", async () => {
+    expect(await makeSettings({ ...env, KEYBR_PUBLIC_ID: undefined, HABIT_ID_KEYBR: "habit-k" }).isEnabled()).toBe(false);
+    expect(await makeSettings({ ...env, KEYBR_PUBLIC_ID: "pub-123", HABIT_ID_KEYBR: undefined }).isEnabled()).toBe(false);
+    expect(await makeSettings({ ...env, KEYBR_PUBLIC_ID: "pub-123", HABIT_ID_KEYBR: "" }).isEnabled()).toBe(false);
+    expect(await makeSettings({ ...env, KEYBR_PUBLIC_ID: "pub-123", HABIT_ID_KEYBR: "habit-k" }).isEnabled()).toBe(true);
   });
 
   it("requests the public id's sync data URL with no Authorization or Cookie header", async () => {
@@ -339,6 +351,7 @@ describe("keybrIntegration", () => {
       today: "2026-03-29",
       now: new Date("2026-03-29T10:00:00Z"),
       fetchFn: fetchReturning(writer.buffer()),
+      settings: makeSettings(testEnv),
     };
     const values = await keybrIntegration.fetchToday(context);
 

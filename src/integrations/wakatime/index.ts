@@ -1,4 +1,14 @@
-import type { Env, HabitValue, Integration, SourceContext } from "../types";
+import type { HabitValue, Integration, SettingDescriptor, SourceContext } from "../types";
+
+const WAKATIME_SETTINGS: SettingDescriptor[] = [
+  {
+    key: "apiKey",
+    type: "string",
+    secret: true,
+    required: true,
+    description: "WakaTime API key, from wakatime.com/settings/api-key.",
+  },
+];
 
 interface WakatimeSummaries {
   data: { grand_total: { total_seconds: number } }[];
@@ -6,16 +16,20 @@ interface WakatimeSummaries {
 
 export const wakatimeIntegration: Integration = {
   name: "wakatime",
-
-  enabled(env: Env): boolean {
-    return Boolean(env.WAKATIME_API_KEY && env.HABIT_ID_WAKATIME);
-  },
+  settings: WAKATIME_SETTINGS,
 
   async fetchToday(context: SourceContext): Promise<HabitValue[]> {
-    const { env, today, fetchFn } = context;
+    const { today, fetchFn, settings } = context;
+    const apiKey = await settings.getString("apiKey");
+    const habitId = await settings.getString("habitId");
+    // Guaranteed present: fetchToday only runs once SettingsResolver.isEnabled() has confirmed
+    // every required setting resolved non-empty.
+    if (!apiKey || !habitId) {
+      throw new Error("wakatime is enabled but a required setting resolved empty; this should be unreachable");
+    }
     const url = `https://wakatime.com/api/v1/users/current/summaries?start=${today}&end=${today}`;
     const response = await fetchFn(url, {
-      headers: { Authorization: `Basic ${btoa(env.WAKATIME_API_KEY!)}` },
+      headers: { Authorization: `Basic ${btoa(apiKey)}` },
     });
     if (!response.ok) {
       throw new Error(`WakaTime summaries request failed with status ${response.status}`);
@@ -27,6 +41,6 @@ export const wakatimeIntegration: Integration = {
       throw new Error("WakaTime returned an unexpected payload shape");
     }
     const totalSeconds = summaries.data.reduce((sum, day) => sum + day.grand_total.total_seconds, 0);
-    return [{ habitId: env.HABIT_ID_WAKATIME!, value: Math.round(totalSeconds / 60), unit: "min" }];
+    return [{ habitId, value: Math.round(totalSeconds / 60), unit: "min" }];
   },
 };

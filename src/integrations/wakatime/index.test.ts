@@ -1,17 +1,23 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { wakatimeIntegration } from "./index";
+import { SettingsResolver } from "../../settings";
 import type { Env, SourceContext } from "../types";
 
 function makeContext(testEnv: Env, fetchFn: typeof fetch): SourceContext {
-  return { env: testEnv, timeZone: "Europe/Berlin", today: "2026-08-04", now: new Date("2026-08-04T10:00:00Z"), fetchFn };
+  const settings = new SettingsResolver(testEnv, testEnv.STATE, "wakatime", wakatimeIntegration.settings);
+  return { env: testEnv, timeZone: "Europe/Berlin", today: "2026-08-04", now: new Date("2026-08-04T10:00:00Z"), fetchFn, settings };
+}
+
+function isEnabled(testEnv: Env): Promise<boolean> {
+  return new SettingsResolver(testEnv, testEnv.STATE, "wakatime", wakatimeIntegration.settings).isEnabled();
 }
 
 describe("wakatimeIntegration", () => {
-  it("is disabled without an API key and habit id", () => {
-    expect(wakatimeIntegration.enabled({ ...env, WAKATIME_API_KEY: undefined })).toBe(false);
-    expect(wakatimeIntegration.enabled({ ...env, WAKATIME_API_KEY: "key", HABIT_ID_WAKATIME: "" })).toBe(false);
-    expect(wakatimeIntegration.enabled({ ...env, WAKATIME_API_KEY: "key", HABIT_ID_WAKATIME: "habit-w" })).toBe(true);
+  it("is disabled without an API key and habit id", async () => {
+    expect(await isEnabled({ ...env, WAKATIME_API_KEY: undefined })).toBe(false);
+    expect(await isEnabled({ ...env, WAKATIME_API_KEY: "key", HABIT_ID_WAKATIME: "" })).toBe(false);
+    expect(await isEnabled({ ...env, WAKATIME_API_KEY: "key", HABIT_ID_WAKATIME: "habit-w" })).toBe(true);
   });
 
   it("sums today's grand total into minutes", async () => {

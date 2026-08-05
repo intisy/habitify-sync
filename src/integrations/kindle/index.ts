@@ -1,10 +1,11 @@
 import { readJson, writeJson } from "../../state";
+import type { SettingsResolver } from "../../settings";
 import {
   AuthNeededError,
-  type Env,
   type HabitValue,
   type Integration,
   type RouteContext,
+  type SettingDescriptor,
   type SourceContext,
 } from "../types";
 
@@ -39,6 +40,27 @@ const DEFAULT_POSITIONS_PER_PAGE = 1800;
 // paperback. Used only when a book has no entry in KINDLE_PAGE_COUNTS, i.e. no real printed page
 // count to divide the exact word count by.
 const DEFAULT_WORDS_PER_PAGE = 250;
+
+const KINDLE_SETTINGS: SettingDescriptor[] = [
+  {
+    key: "wordsPerPage",
+    type: "number",
+    default: String(DEFAULT_WORDS_PER_PAGE),
+    description: "Words per printed page, used only when no printed page count is available at all.",
+  },
+  {
+    key: "pageCounts",
+    type: "json",
+    description:
+      "Optional override mapping asin -> printed page count, for a book whose printed page count Amazon's own product page won't yield.",
+  },
+  {
+    key: "positionsPerPage",
+    type: "number",
+    default: String(DEFAULT_POSITIONS_PER_PAGE),
+    description: "Whispersync positions per printed page, a last-resort fallback when a book's word count is unavailable.",
+  },
+];
 
 // This integration's own KV keys — not shared generic state.
 export const KINDLE_STATE_KEYS = {
@@ -268,15 +290,15 @@ async function fetchWordCount(
 // mechanism: printed page counts are normally discovered automatically from each book's Amazon
 // product page (see resolvePageCount below). This map exists only to rescue a book for which that
 // discovery fails (e.g. Amazon blocks the Worker's product-page request), so it requires no
-// day-to-day maintenance. Parsed defensively: invalid JSON, a non-object body (e.g. an array), or
-// an individual entry that isn't a positive finite number is dropped — per-entry for the bad-value
-// case, entirely for a malformed top-level body — so a typo degrades that book (or every book) to
-// the dynamic lookup (or, failing that, the words-per-page estimate) rather than throwing.
-function parsePageCounts(raw: string | undefined): Record<string, number> {
-  if (!raw) return {};
+// day-to-day maintenance. Parsed defensively: invalid JSON (a SettingsResolver.getJson syntax
+// error), a non-object body (e.g. an array), or an individual entry that isn't a positive finite
+// number is dropped — per-entry for the bad-value case, entirely for a malformed top-level body —
+// so a typo degrades that book (or every book) to the dynamic lookup (or, failing that, the
+// words-per-page estimate) rather than throwing.
+async function resolvePrintPageCountOverrides(settings: SettingsResolver): Promise<Record<string, number>> {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = await settings.getJson("pageCounts");
   } catch {
     return {};
   }
@@ -292,9 +314,9 @@ function parsePageCounts(raw: string | undefined): Record<string, number> {
   return result;
 }
 
-// KINDLE_PAGE_COUNTS entries are keyed by asin only (see parsePageCounts above); the same asin
-// keying is used for the dynamic lookup's cache below, since a printed page count belongs to the
-// print edition, not to any one Kindle content revision.
+// KINDLE_PAGE_COUNTS entries are keyed by asin only (see resolvePrintPageCountOverrides above);
+// the same asin keying is used for the dynamic lookup's cache below, since a printed page count
+// belongs to the print edition, not to any one Kindle content revision.
 
 // Cached in KV per asin. `pages: number` is a confirmed printed page count, cached permanently —
 // it cannot change. `pages: null` is a negative marker: the lookup was already attempted and
@@ -548,13 +570,16 @@ async function handleDeleteSession(_request: Request, context: RouteContext): Pr
 
 export const kindleIntegration: Integration = {
   name: "kindle",
-
-  enabled(env: Env): boolean {
-    return Boolean(env.HABIT_ID_KINDLE);
-  },
+  settings: KINDLE_SETTINGS,
 
   async fetchToday(context: SourceContext): Promise<HabitValue[]> {
-    const { env, today, fetchFn } = context;
+    const { env, today, fetchFn, settings } = context;
+    // Guaranteed present: fetchToday only runs once SettingsResolver.isEnabled() has confirmed
+    // every required setting resolved non-empty (habitId is kindle's only required setting).
+    const habitId = await settings.getString("habitId");
+    if (!habitId) {
+      throw new Error("kindle is enabled but habitId resolved empty; this should be unreachable");
+    }
     const session = await readJson<KindleSession>(env.STATE, KINDLE_STATE_KEYS.session);
     if (!session) {
       throw new AuthNeededError("Kindle session not captured; PUT /kindle/session");
@@ -570,9 +595,9 @@ export const kindleIntegration: Integration = {
     const library = await fetchLibrary(session.cookie, sessionId, fetchFn);
     // Guarded against a nonsensical override (0, negative, or unparseable) producing a bogus,
     // inflated (or negative) page count, for both the fallback divisor and the estimate divisor.
-    const positionsPerPage = Math.max(1, Number(env.KINDLE_POSITIONS_PER_PAGE) || DEFAULT_POSITIONS_PER_PAGE);
-    const wordsPerPage = Math.max(1, Number(env.KINDLE_WORDS_PER_PAGE) || DEFAULT_WORDS_PER_PAGE);
-    const printPageCounts = parsePageCounts(env.KINDLE_PAGE_COUNTS);
+    const positionsPerPage = Math.max(1, (await settings.getNumber("positionsPerPage")) ?? DEFAULT_POSITIONS_PER_PAGE);
+    const wordsPerPage = Math.max(1, (await settings.getNumber("wordsPerPage")) ?? DEFAULT_WORDS_PER_PAGE);
+    const printPageCounts = await resolvePrintPageCountOverrides(settings);
 
     interface ProcessedBook {
       title: string;
@@ -696,7 +721,7 @@ export const kindleIntegration: Integration = {
     } satisfies KindlePositions);
 
     const habitValue: HabitValue = {
-      habitId: env.HABIT_ID_KINDLE!,
+      habitId,
       value: Math.round(total),
       unit: "pages",
       diagnostics: { estimated: anyEstimated, books: bookDiagnostics },
