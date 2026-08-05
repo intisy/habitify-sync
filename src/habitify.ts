@@ -96,6 +96,18 @@ function parseHabitSummary(habit: unknown): HabitSummary | undefined {
 // the error message.
 export class HabitInputValidationError extends Error {}
 
+// Thrown by request() below, carrying the HTTP status Habitify responded with. writeTodayValue
+// needs this to distinguish "Habitify rejected this request" (4xx) from a transient outage
+// (5xx) when deciding whether the negative-post fallback applies.
+export class HabitifyRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
 // Validated entirely before any network call: a 422 from Habitify names the offending field far
 // less clearly than a local check can, and there's no reason to spend a round trip discovering
 // a mistake this function can catch for free.
@@ -132,6 +144,44 @@ function assertValidCreateHabitInput(input: CreateHabitInput): void {
 // format rather than a 502 built from whatever Habitify's own validation error looks like.
 const JOURNAL_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
+// Parses GET /habits/journal's response body into a map of habitId -> progress.current — the
+// authoritative value Habitify currently holds for that habit on the requested day. Defensive in
+// the same way as parseHabitSummary above: accepts either { data: [...] } or a bare array, and
+// simply omits any entry that isn't a usable { id, progress.current } pair (a habit with no
+// measurable goal has no `progress.current` at all, and is intentionally left out of the map —
+// callers treat an absent habitId as current 0, not an error).
+function parseJournalCurrentValues(journal: unknown): Map<string, number> {
+  const entries = Array.isArray(journal) ? journal : (journal as { data?: unknown[] })?.data ?? [];
+  const currentValuesById = new Map<string, number>();
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const id = record.id;
+    if (typeof id !== "string" || id.length === 0) continue;
+    const progress = record.progress;
+    if (typeof progress !== "object" || progress === null) continue;
+    const current = (progress as Record<string, unknown>).current;
+    if (typeof current === "number" && Number.isFinite(current)) {
+      currentValuesById.set(id, current);
+    }
+  }
+  return currentValuesById;
+}
+
+// Result of one writeTodayValue call, surfaced by sync.ts into per-habit diagnostics so the
+// correction is debuggable after the fact: what difference was posted, and whether Habitify
+// rejected the direct negative post and forced the undo-then-total fallback.
+export interface WriteTodayValueResult {
+  difference: number;
+  usedUndoFallback: boolean;
+}
+
+// Below this absolute difference, a habit is treated as already converged and no request is
+// made at all. Floating-point accumulation across integrations (e.g. minutes stored as a
+// fractional-hour source value) means "the same value" rarely arrives as an exact equality, so a
+// tiny tolerance avoids posting a no-op fractional log entry every single sync.
+const CONVERGENCE_EPSILON = 0.005;
+
 export class HabitifyClient {
   constructor(
     private readonly apiKey: string,
@@ -153,7 +203,10 @@ export class HabitifyClient {
     // POST /logs returns 201, not 200, so `response.ok` (2xx) is checked rather than an exact
     // status code.
     if (!response.ok) {
-      throw new Error(`Habitify ${method} ${path} failed with status ${response.status}: ${await response.text()}`);
+      throw new HabitifyRequestError(
+        `Habitify ${method} ${path} failed with status ${response.status}: ${await response.text()}`,
+        response.status,
+      );
     }
   }
 
@@ -225,6 +278,15 @@ export class HabitifyClient {
     return (await response.json()) as unknown;
   }
 
+  // The single read a whole sync run's convergence math is based on (see sync.ts, which calls
+  // this once per run rather than once per habit): today's journal, parsed down to
+  // habitId -> progress.current. Kept separate from getJournalRaw above, which stays a verbatim
+  // diagnostic escape hatch for the HTTP API.
+  async getCurrentValuesByHabitId(date: string): Promise<Map<string, number>> {
+    const journal = await this.getJournalRaw(date);
+    return parseJournalCurrentValues(journal);
+  }
+
   // Creates a new Habitify habit so an operator can provision one to log into without ever
   // handling HABITIFY_API_KEY locally. Defaults mirror the simplest possible habit: a "good"
   // habit that occurs every day. Optional fields are omitted from the request body entirely
@@ -283,21 +345,62 @@ export class HabitifyClient {
     );
   }
 
-  // Habitify v2 has no range-delete endpoint for logs (only per-log DELETE by id, and there's no
-  // GET to discover log ids), so `POST /logs/undo` — which clears every log for the habit on a
-  // given day — is the idempotency primitive instead: undo today's logs, then post the fresh
-  // total. Rerunning the same hour with the same source data converges to the same result.
-  async upsertTodayLog(habit: HabitValue, timeZone: string, now: Date): Promise<void> {
-    assertHabitifyUnitSymbol(habit.unit);
+  // Habitify's log API only appends, never replaces, so converging a habit to an exact daily
+  // target means posting the DIFFERENCE between the target and whatever Habitify already holds
+  // for today (read once per run via getCurrentValuesByHabitId, not re-read here) — never the
+  // total. Posting the total on top of an existing value is exactly the accumulation bug this
+  // replaced: it inflated every habit's daily value on every hourly sync.
+  //
+  // A negative difference (today's value is already too high) is posted as a negative `value` in
+  // the log body — Habitify's schema places no declared minimum on it, and this is the PRIMARY
+  // correction mechanism. `POST /logs/undo` is retained only as a best-effort FALLBACK for when
+  // Habitify rejects a negative post (any 4xx): undo was observed on the live worker to be a
+  // complete no-op for measurable logs (it returns 200 and changes nothing — see the design doc's
+  // idempotency section), so this fallback may accomplish nothing and leave today's value still
+  // too high. It's attempted anyway, and recorded, so the next run's correction is visible
+  // instead of this failing silently.
+  async writeTodayValue(
+    habit: HabitValue,
+    unitSymbol: string,
+    target: number,
+    currentValue: number,
+    timeZone: string,
+    now: Date,
+  ): Promise<WriteTodayValueResult> {
+    assertHabitifyUnitSymbol(unitSymbol);
     const targetDate = todayInTimeZone(timeZone, now);
-    await this.request("POST", `/habits/${habit.habitId}/logs/undo`, { targetDate });
-    // List fields explicitly here — never spread a HabitValue into the body. HabitValue can carry
-    // a `diagnostics` object meant only for GET /status, and it must never leave for this
-    // third-party API.
-    await this.request("POST", `/habits/${habit.habitId}/logs`, {
-      unitSymbol: habit.unit,
-      value: habit.value,
-      targetDate,
-    });
+    const difference = target - currentValue;
+
+    if (Math.abs(difference) < CONVERGENCE_EPSILON) {
+      // Already converged: making a request here would just be a no-op write, at the cost of a
+      // real API call every quiet hour.
+      return { difference, usedUndoFallback: false };
+    }
+
+    try {
+      await this.request("POST", `/habits/${habit.habitId}/logs`, {
+        unitSymbol,
+        value: difference,
+        targetDate,
+      });
+      return { difference, usedUndoFallback: false };
+    } catch (error) {
+      const rejectedAsClientError =
+        error instanceof HabitifyRequestError && error.status >= 400 && error.status < 500;
+      if (difference >= 0 || !rejectedAsClientError) {
+        // A positive difference being rejected, or any 5xx, is a genuine failure — not the
+        // negative-post rejection this fallback exists for. Let it propagate.
+        throw error;
+      }
+      // Fallback: undo (best-effort — see the comment above, it's likely a no-op), then post the
+      // full target rather than a difference, on the assumption undo cleared the day.
+      await this.request("POST", `/habits/${habit.habitId}/logs/undo`, { targetDate });
+      await this.request("POST", `/habits/${habit.habitId}/logs`, {
+        unitSymbol,
+        value: target,
+        targetDate,
+      });
+      return { difference, usedUndoFallback: true };
+    }
   }
 }

@@ -1,5 +1,5 @@
 import { HabitifyClient, isHabitifyUnitSymbol, type HabitifyUnitSymbol } from "./habitify";
-import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "./state";
+import { readJson, STATE_KEYS, writeJson, type HabitConvergence, type SourceStatus } from "./state";
 import { AuthNeededError, type Env, type HabitValue, type Integration, type SourceContext } from "./integrations/types";
 import { SettingsResolver } from "./settings";
 import { todayInTimeZone } from "./time";
@@ -93,6 +93,20 @@ export async function runSync(
     habitUnitLookupError = error instanceof Error ? error.message : String(error);
   }
 
+  // Read once per run, not once per habit: this is the single source of truth every value below
+  // converges toward by posting a DIFFERENCE rather than a total (see
+  // HabitifyClient.writeTodayValue). Unlike the unit lookup above, a failure here is NOT tolerated
+  // with a silent fallback — falling back to posting the full total on a failed read is exactly
+  // the accumulation bug being fixed, so a failed journal read fails every write for this run
+  // instead (see the per-source handling below).
+  let currentValuesById = new Map<string, number>();
+  let journalLookupError: string | undefined;
+  try {
+    currentValuesById = await habitify.getCurrentValuesByHabitId(today);
+  } catch (error) {
+    journalLookupError = error instanceof Error ? error.message : String(error);
+  }
+
   for (const source of sources) {
     if (onlySource && source.name !== onlySource) continue;
     const previous = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
@@ -105,23 +119,51 @@ export async function runSync(
       continue;
     }
 
-    const context: SourceContext = { env, timeZone, today, now, fetchFn, settings };
     let status: SourceStatus;
+    if (journalLookupError !== undefined) {
+      // Nothing is written this run: a missed hour self-corrects the next time the journal read
+      // succeeds, but writing without knowing today's true current value risks re-inflating
+      // exactly what convergence-by-difference exists to prevent.
+      status = {
+        state: "error",
+        lastSuccessAt: previous?.lastSuccessAt,
+        lastErrorAt: now.toISOString(),
+        lastError: `Could not read today's Habitify journal, so nothing was written this run: ${journalLookupError}`,
+      };
+      await writeJson(env.STATE, STATE_KEYS.sourceStatus(source.name), status);
+      results.push({ source: source.name, status });
+      continue;
+    }
+
+    const context: SourceContext = { env, timeZone, today, now, fetchFn, settings };
     try {
       const values = await source.fetchToday(context);
       const unitFallbacks: string[] = habitUnitLookupError
         ? [`could not look up Habitify habit units (${habitUnitLookupError}); using each value's integration-declared unit`]
         : [];
+      const convergence: HabitConvergence[] = [];
       for (const value of values) {
         const { unit, fallbackReason } = resolveHabitifyUnit(value, habitUnitsById);
         if (fallbackReason && !habitUnitLookupError) unitFallbacks.push(fallbackReason);
-        await habitify.upsertTodayLog({ ...value, unit }, timeZone, now);
+        // A habit absent from the journal (no measurable log yet today) is treated as current 0,
+        // so its full target gets posted.
+        const current = currentValuesById.get(value.habitId) ?? 0;
+        const { difference, usedUndoFallback } = await habitify.writeTodayValue(
+          value,
+          unit,
+          value.value,
+          current,
+          timeZone,
+          now,
+        );
+        convergence.push({ habitId: value.habitId, target: value.value, current, difference, usedUndoFallback });
       }
       status = {
         state: "ok",
         lastSuccessAt: now.toISOString(),
         values,
         ...(unitFallbacks.length > 0 ? { unitFallbacks } : {}),
+        ...(convergence.length > 0 ? { convergence } : {}),
       };
     } catch (error) {
       status = {

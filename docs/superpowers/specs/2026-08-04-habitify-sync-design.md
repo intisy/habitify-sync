@@ -167,6 +167,40 @@ OAuth callback.
   and preferred over an integration's declared unit, since Habitify's unit
   symbols are a closed enum that doesn't include every semantic unit an
   integration might declare (e.g. Kindle's `"pages"`).
+
+  **2026-08-05 correction — `logs/undo` observed to be a no-op:** the
+  undo-then-post-total upsert above was live for less than a day before
+  measurement showed it was silently inflating every habit's daily value on
+  every hourly sync. Direct observation on the live worker: `POST
+  /habits/{habitId}/logs/undo` returns `200` and changes nothing for a
+  measurable log — despite the OpenAPI spec's description ("Remove all log
+  entries for a habit on a specific date") — so each hourly run's "post the
+  current total" step landed on top of the previous total instead of a
+  cleared day. Confirmed by three habits inflating by exactly their true
+  daily value on one manual sync (96→104, 1496→1683, 105→123).
+
+  The fix replaces "undo, then post the total" with **convergence by
+  difference**: once per run (not once per habit) the worker reads `GET
+  /habits/journal` for today and takes each habit's `progress.current` as
+  the authoritative value Habitify already holds. For each value it posts
+  `target - current` — positive or negative, skipped entirely under a small
+  epsilon — which converges the habit to `target` without ever needing a
+  clear-the-day primitive. Habitify's log schema declares no minimum on a
+  log's `value`, which is what makes posting a negative correction directly
+  possible. `POST /habits/{habitId}/logs/undo` is kept only as a best-effort
+  fallback for the rare case where Habitify rejects a negative post outright
+  (any 4xx) — it is not trusted to succeed, since it was directly observed
+  not to; the fallback undoes (whether or not that does anything), posts the
+  full target, and records that the fallback path was taken so the next
+  run's correction is debuggable rather than silent. A failed journal read
+  is fatal for that run's writes (no fallback to posting a total), since a
+  guessed "current" value reintroduces the exact inflation this fix removes.
+
+  One consequence worth recording: because the worker no longer clears
+  today's logs before writing, a manual entry made in the Habitify app for
+  today is no longer wiped on the next run — it is instead **converged away
+  from**, since the worker only sees Habitify's total and has no way to
+  distinguish a manual entry from its own prior write.
 - Per-source isolation via try/catch in the orchestrator; failures land in the
   status record, visible through `GET /status`.
 - No retry queues or push notifications in v1 (YAGNI).
@@ -176,9 +210,13 @@ OAuth callback.
 Vitest with `@cloudflare/vitest-pool-workers`:
 
 - Unit tests per source against mocked `fetch` using recorded real JSON shapes.
-- Habitify client test proving the delete-then-post upsert.
+- Habitify client tests proving convergence-by-difference: positive and
+  negative differences, the zero/epsilon no-request case, and the
+  negative-post-rejected fallback to undo-then-post-total.
 - Orchestrator test proving one throwing source does not stop the others and
-  that status records are written.
+  that status records are written, plus tests proving the journal is read
+  once per run and that a failed journal read blocks writes without
+  falling back to posting a total.
 
 ## Out of scope (v1)
 

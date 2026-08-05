@@ -47,68 +47,131 @@ function recordingCreatedHabitFetch(recorded: RecordedRequest[], status = 201): 
   }) as typeof fetch;
 }
 
-describe("HabitifyClient.upsertTodayLog", () => {
+describe("HabitifyClient.writeTodayValue", () => {
   // 2026-08-04T23:30 UTC is 2026-08-05T01:30 in Europe/Berlin (UTC+2 under DST) — past UTC
   // midnight but not yet past Berlin midnight, so this proves todayInTimeZone (local calendar
   // date) is used for targetDate, not a UTC-derived date, which would wrongly read 2026-08-04.
   const now = new Date("2026-08-04T23:30:00Z");
+  const habit = { habitId: "habit-1", value: 0, unit: "min" };
 
-  it("undoes today's logs, then posts the new value, in that order", async () => {
+  it("posts the positive difference when target > current, and makes no undo call", async () => {
     const recorded: RecordedRequest[] = [];
     const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
-    await client.upsertTodayLog({ habitId: "habit-1", value: 42, unit: "min" }, "Europe/Berlin", now);
+    const result = await client.writeTodayValue(habit, "min", 42, 10, "Europe/Berlin", now);
 
-    expect(recorded).toHaveLength(2);
-
+    expect(recorded).toHaveLength(1);
     expect(recorded[0].method).toBe("POST");
-    expect(recorded[0].url).toBe("https://habitify.example/v2/habits/habit-1/logs/undo");
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits/habit-1/logs");
     expect(recorded[0].apiKey).toBe("api-key");
     expect(recorded[0].authorization).toBeNull();
-    expect(JSON.parse(recorded[0].body!)).toEqual({ targetDate: "2026-08-05" });
-
-    expect(recorded[1].method).toBe("POST");
-    expect(recorded[1].url).toBe("https://habitify.example/v2/habits/habit-1/logs");
-    expect(recorded[1].apiKey).toBe("api-key");
-    expect(recorded[1].authorization).toBeNull();
-    expect(JSON.parse(recorded[1].body!)).toEqual({
+    expect(JSON.parse(recorded[0].body!)).toEqual({
       unitSymbol: "min",
-      value: 42,
+      value: 32,
       targetDate: "2026-08-05",
     });
+    expect(result).toEqual({ difference: 32, usedUndoFallback: false });
   });
 
-  it("accepts a 201 from POST /logs", async () => {
-    const client = new HabitifyClient("api-key", recordingFetch([], 201), "https://habitify.example/v2");
+  // This is the case that fixes the live inflation bug: Pages read stood at 104 with a true
+  // target of 8, and posting -96 is what brings it back down without ever calling the broken
+  // undo endpoint.
+  it("posts the negative difference when target < current", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    const result = await client.writeTodayValue(habit, "rep", 8, 104, "Europe/Berlin", now);
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits/habit-1/logs");
+    expect(JSON.parse(recorded[0].body!)).toEqual({
+      unitSymbol: "rep",
+      value: -96,
+      targetDate: "2026-08-05",
+    });
+    expect(result).toEqual({ difference: -96, usedUndoFallback: false });
+  });
+
+  it("makes no request at all when target equals current", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    const result = await client.writeTodayValue(habit, "min", 10, 10, "Europe/Berlin", now);
+
+    expect(recorded).toHaveLength(0);
+    expect(result).toEqual({ difference: 0, usedUndoFallback: false });
+  });
+
+  it("makes no request when the difference is within the convergence epsilon", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
+    const result = await client.writeTodayValue(habit, "min", 10.003, 10, "Europe/Berlin", now);
+
+    expect(recorded).toHaveLength(0);
+    expect(result.usedUndoFallback).toBe(false);
+  });
+
+  it("throws on a non-ok response from the log-post call when the difference is positive", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 422), "https://habitify.example/v2");
     await expect(
-      client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now),
-    ).resolves.toBeUndefined();
+      client.writeTodayValue(habit, "min", 42, 10, "Europe/Berlin", now),
+    ).rejects.toThrow("Habitify POST /habits/habit-1/logs failed with status 422");
   });
 
-  it("throws on a non-ok response from the undo call", async () => {
-    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example/v2");
-    await expect(
-      client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now),
-    ).rejects.toThrow("Habitify POST /habits/habit-1/logs/undo failed with status 401");
-  });
-
-  it("throws on a non-ok response from the log-post call", async () => {
+  it("falls back to undo-then-post-total when a negative post is rejected with a 4xx", async () => {
+    const recorded: RecordedRequest[] = [];
     let callCount = 0;
-    const fetchFn = (async () => {
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
       callCount++;
-      // Undo (1st call) succeeds; the log POST (2nd call) fails.
-      return new Response(callCount === 1 ? "{}" : "error", { status: callCount === 1 ? 200 : 422 });
+      const headers = new Headers(init?.headers);
+      recorded.push({
+        method: init?.method ?? "GET",
+        url: String(input),
+        body: init?.body === undefined ? undefined : String(init.body),
+        apiKey: headers.get("X-API-Key"),
+        authorization: headers.get("Authorization"),
+      });
+      // 1st call: the direct negative post, rejected with a 422. 2nd call: undo (best-effort,
+      // succeeds but is assumed a no-op). 3rd call: the full-total post, succeeds.
+      if (callCount === 1) return new Response("rejected", { status: 422 });
+      return new Response("{}", { status: 200 });
     }) as typeof fetch;
     const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
-    await expect(
-      client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now),
-    ).rejects.toThrow("Habitify POST /habits/habit-1/logs failed with status 422");
+
+    const result = await client.writeTodayValue(habit, "rep", 8, 104, "Europe/Berlin", now);
+
+    expect(recorded).toHaveLength(3);
+    expect(recorded[0].url).toBe("https://habitify.example/v2/habits/habit-1/logs");
+    expect(JSON.parse(recorded[0].body!).value).toBe(-96);
+    expect(recorded[1].url).toBe("https://habitify.example/v2/habits/habit-1/logs/undo");
+    expect(JSON.parse(recorded[1].body!)).toEqual({ targetDate: "2026-08-05" });
+    expect(recorded[2].url).toBe("https://habitify.example/v2/habits/habit-1/logs");
+    expect(JSON.parse(recorded[2].body!)).toEqual({ unitSymbol: "rep", value: 8, targetDate: "2026-08-05" });
+    expect(result).toEqual({ difference: -96, usedUndoFallback: true });
+  });
+
+  it("does not fall back when a positive difference is rejected with a 4xx", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 422), "https://habitify.example/v2");
+    await expect(client.writeTodayValue(habit, "rep", 20, 5, "Europe/Berlin", now)).rejects.toThrow(
+      "failed with status 422",
+    );
+    // Only the single rejected attempt — no undo, no second post.
+    expect(recorded).toHaveLength(1);
+  });
+
+  it("does not fall back when a negative difference is rejected with a 5xx", async () => {
+    const recorded: RecordedRequest[] = [];
+    const client = new HabitifyClient("api-key", recordingFetch(recorded, 500), "https://habitify.example/v2");
+    await expect(client.writeTodayValue(habit, "rep", 8, 104, "Europe/Berlin", now)).rejects.toThrow(
+      "failed with status 500",
+    );
+    // A 5xx is treated as a transient outage, not a rejection of the negative value — no fallback.
+    expect(recorded).toHaveLength(1);
   });
 
   it("rejects an invalid unitSymbol before making any request", async () => {
     const recorded: RecordedRequest[] = [];
     const client = new HabitifyClient("api-key", recordingFetch(recorded), "https://habitify.example/v2");
     await expect(
-      client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "pages" }, "Europe/Berlin", now),
+      client.writeTodayValue(habit, "pages", 42, 10, "Europe/Berlin", now),
     ).rejects.toThrow(/Invalid Habitify unitSymbol "pages"/);
     expect(recorded).toHaveLength(0);
   });
@@ -291,6 +354,59 @@ describe("HabitifyClient.getJournalRaw", () => {
   it("throws on a non-ok response", async () => {
     const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example/v2");
     await expect(client.getJournalRaw()).rejects.toThrow("Habitify GET /habits/journal failed with status 401");
+  });
+});
+
+describe("HabitifyClient.getCurrentValuesByHabitId", () => {
+  it("parses a { data: [...] } journal into habitId -> progress.current", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({
+        data: [
+          { id: "habit-1", name: "Pages read", progress: { current: 104, target: 8 } },
+          { id: "habit-2", name: "Coding time", progress: { current: 1683, target: 187 } },
+        ],
+      }),
+      "https://habitify.example/v2",
+    );
+    const currentValuesById = await client.getCurrentValuesByHabitId("2026-08-05");
+    expect(currentValuesById.get("habit-1")).toBe(104);
+    expect(currentValuesById.get("habit-2")).toBe(1683);
+  });
+
+  it("tolerates a bare array response", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch([{ id: "habit-1", progress: { current: 5 } }]),
+      "https://habitify.example/v2",
+    );
+    const currentValuesById = await client.getCurrentValuesByHabitId("2026-08-05");
+    expect(currentValuesById.get("habit-1")).toBe(5);
+  });
+
+  it("omits an entry with no id, or no numeric progress.current", async () => {
+    const client = new HabitifyClient(
+      "api-key",
+      jsonFetch({
+        data: [
+          { name: "No id", progress: { current: 1 } },
+          { id: "habit-checkin-only", name: "Check-in habit" },
+          { id: "habit-bad-progress", progress: { current: "not-a-number" } },
+          { id: "habit-good", progress: { current: 3 } },
+        ],
+      }),
+      "https://habitify.example/v2",
+    );
+    const currentValuesById = await client.getCurrentValuesByHabitId("2026-08-05");
+    expect(currentValuesById.size).toBe(1);
+    expect(currentValuesById.get("habit-good")).toBe(3);
+  });
+
+  it("propagates a failed journal read", async () => {
+    const client = new HabitifyClient("api-key", recordingFetch([], 401), "https://habitify.example/v2");
+    await expect(client.getCurrentValuesByHabitId("2026-08-05")).rejects.toThrow(
+      "Habitify GET /habits/journal failed with status 401",
+    );
   });
 });
 
@@ -541,10 +657,18 @@ describe("HabitifyClient fetchFn this-binding", () => {
     return { fetchFn: thisRecordingFetch as unknown as typeof fetch, getRecordedThis: () => recordedThis };
   }
 
-  it("invokes fetchFn with this === undefined in upsertTodayLog, not the HabitifyClient instance", async () => {
+  it("invokes fetchFn with this === undefined in writeTodayValue, not the HabitifyClient instance", async () => {
     const { fetchFn, getRecordedThis } = makeThisRecordingFetch({});
     const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
-    await client.upsertTodayLog({ habitId: "habit-1", value: 1, unit: "min" }, "Europe/Berlin", now);
+    await client.writeTodayValue({ habitId: "habit-1", value: 0, unit: "min" }, "min", 42, 10, "Europe/Berlin", now);
+    expect(getRecordedThis()).toBeUndefined();
+    expect(getRecordedThis()).not.toBe(client);
+  });
+
+  it("invokes fetchFn with this === undefined in getCurrentValuesByHabitId, not the HabitifyClient instance", async () => {
+    const { fetchFn, getRecordedThis } = makeThisRecordingFetch({ data: [] });
+    const client = new HabitifyClient("api-key", fetchFn, "https://habitify.example/v2");
+    await client.getCurrentValuesByHabitId("2026-08-05");
     expect(getRecordedThis()).toBeUndefined();
     expect(getRecordedThis()).not.toBe(client);
   });
