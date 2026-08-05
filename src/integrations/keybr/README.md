@@ -11,17 +11,25 @@ lessons.
 
 ## Configuration
 
-| Key | Kind | Where to get it |
-|---|---|---|
-| `KEYBR_PUBLIC_ID` | Var (`wrangler.toml`) | The `{id}` segment of your `https://www.keybr.com/profile/{id}` URL |
-| `HABIT_ID_KEYBR` | Var (`wrangler.toml`) | `curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits`, or `GET /habits` on the deployed worker |
+Declared in `src/integrations/keybr/index.ts` as this integration's
+`settings` (see the root README's
+[Configuration model](../../../README.md#configuration-model)).
 
-**Neither of these is a secret.** `KEYBR_PUBLIC_ID` is not a credential — it's
-the id embedded in your own shareable profile URL, and it never expires.
-There is nothing to authenticate here at all: keybr's sync data endpoint
-(`GET https://www.keybr.com/_/sync/data/{publicId}`) takes no cookie, no
-token, and no headers of any kind. Both keys belong in `wrangler.toml`'s
-`[vars]`, not behind `wrangler secret put`.
+| Key | Derived variable | Required | Where to get it |
+|---|---|---|---|
+| `publicId` | `KEYBR_PUBLIC_ID` | yes | The `{id}` segment of your `https://www.keybr.com/profile/{id}` URL |
+
+`habitId` (`HABIT_ID_KEYBR`) is implicit on every integration — see the
+[Configuration model](../../../README.md#configuration-model). `GET
+/config/keybr` shows the live, current value of both.
+
+**Neither is a secret.** `KEYBR_PUBLIC_ID` is not a credential — it's the id
+embedded in your own shareable profile URL, and it never expires. There is
+nothing to authenticate here at all: keybr's sync data endpoint (`GET
+https://www.keybr.com/_/sync/data/{publicId}`) takes no cookie, no token, and
+no headers of any kind. Both settings resolve fine from `wrangler.toml`'s
+`[vars]` (never behind `wrangler secret put`), or can be overridden at
+runtime via `PUT /config/keybr`.
 
 ## Setup
 

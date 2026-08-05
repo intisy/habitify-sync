@@ -81,12 +81,23 @@ for most books, no entries at all.
 
 ## Configuration
 
-| Key | Kind | Where to get it |
-|---|---|---|
-| `HABIT_ID_KINDLE` | Var (`wrangler.toml`) | `curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits` |
-| `KINDLE_WORDS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — words per printed page when no printed page count is available at all (neither discovered nor overridden), default `250` (a standard publishing convention). |
-| `KINDLE_PAGE_COUNTS` | Var (`wrangler.toml`), optional, **override only** | Normally left empty — printed page counts are discovered automatically (see [How the page count is discovered](#how-the-page-count-is-discovered)). Only fill this in to rescue a book for which that discovery fails: a JSON object mapping asin to printed page count, e.g. `{"B009ZUZ9FW":272,"B013UWFM52":304}`, found on the book's Amazon product page under "Print length". An entry here always wins over the discovered value for that book. |
-| `KINDLE_POSITIONS_PER_PAGE` | Var (`wrangler.toml`), optional | No external source — an estimate of Whispersync position units per printed page, default `1800`. Only used as a last-resort fallback when a book's word count is unavailable. See [Gotchas](#gotchas) for how that default was chosen. |
+Declared in `src/integrations/kindle/index.ts` as this integration's
+`settings` (see the root README's
+[Configuration model](../../../README.md#configuration-model)). All three are
+optional, each with a built-in default, and none is a secret — every one
+resolves fine from `wrangler.toml`'s `[vars]`, or can be overridden at
+runtime via `PUT /config/kindle`.
+
+| Key | Derived variable | Type | Default | Where to get it |
+|---|---|---|---|---|
+| `wordsPerPage` | `KINDLE_WORDS_PER_PAGE` | number | `250` | No external source — words per printed page when no printed page count is available at all (neither discovered nor overridden); `250` is a standard publishing convention. |
+| `pageCounts` | `KINDLE_PAGE_COUNTS` | json | *(none)* | Normally left unset — printed page counts are discovered automatically (see [How the page count is discovered](#how-the-page-count-is-discovered)). Only set this to rescue a book for which that discovery fails: a JSON object mapping asin to printed page count, e.g. `{"B009ZUZ9FW":272,"B013UWFM52":304}`, found on the book's Amazon product page under "Print length". An entry here always wins over the discovered value for that book. |
+| `positionsPerPage` | `KINDLE_POSITIONS_PER_PAGE` | number | `1800` | No external source — an estimate of Whispersync position units per printed page. Only used as a last-resort fallback when a book's word count is unavailable. See [Gotchas](#gotchas) for how that default was chosen. |
+
+`habitId` (`HABIT_ID_KINDLE`) is implicit on every integration — see the
+[Configuration model](../../../README.md#configuration-model). `GET
+/config/kindle` shows the live, current value and source (`kv`/`env`/`default`)
+of every setting listed here.
 
 Example `wrangler.toml` snippet:
 
