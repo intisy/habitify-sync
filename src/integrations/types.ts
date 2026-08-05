@@ -1,19 +1,31 @@
+import type { SettingsResolver } from "../settings";
+
 export interface Env {
   STATE: KVNamespace;
   HABITIFY_API_KEY: string;
   ADMIN_TOKEN: string;
   TIMEZONE?: string;
-  HABIT_ID_STRAVA?: string;
-  HABIT_ID_WAKATIME?: string;
-  HABIT_ID_KINDLE?: string;
-  HABIT_ID_KEYBR?: string;
-  STRAVA_CLIENT_ID?: string;
-  STRAVA_CLIENT_SECRET?: string;
-  WAKATIME_API_KEY?: string;
-  KINDLE_POSITIONS_PER_PAGE?: string;
-  KINDLE_WORDS_PER_PAGE?: string;
-  KINDLE_PAGE_COUNTS?: string;
-  KEYBR_PUBLIC_ID?: string;
+  // Every per-integration variable (HABIT_ID_<NAME>, and each declared setting's derived name) is
+  // read through this index signature rather than a named field — see src/settings.ts. This is
+  // what keeps Env from growing a field every time an integration declares a setting.
+  [derivedVariableName: string]: unknown;
+}
+
+// One setting an integration accepts, e.g. { key: "clientId", type: "string", secret: true,
+// required: true, description: "..." }. The environment variable it resolves from is never
+// written down separately — see deriveVariableName in src/settings.ts, which derives it from
+// this descriptor's key and the owning integration's name.
+export interface SettingDescriptor {
+  /** Integration-local camelCase name, e.g. "wordsPerPage". */
+  key: string;
+  type: "string" | "number" | "json";
+  /** Required settings gate the derived enabled() — see src/settings.ts. Every integration implicitly requires habitId. */
+  required?: boolean;
+  /** Lives only in Cloudflare secrets: never returned by GET /config, never settable via PUT, never read from KV. */
+  secret?: boolean;
+  default?: string;
+  /** One line, shown by GET /config. */
+  description: string;
 }
 
 export interface HabitValue {
@@ -30,6 +42,9 @@ export interface SourceContext {
   today: string;
   now: Date;
   fetchFn: typeof fetch;
+  // Scoped to this integration alone: `settings.getString("clientId")` resolves STRAVA_CLIENT_ID
+  // for strava but would throw for any other integration. See src/settings.ts.
+  settings: SettingsResolver;
 }
 
 export class AuthNeededError extends Error {}
@@ -39,6 +54,10 @@ export class AuthNeededError extends Error {}
 export interface RouteContext {
   env: Env;
   fetchFn: typeof fetch;
+  // Scoped to the integration that owns this route (see the route-ownership map built in
+  // src/index.ts). A core route not owned by any integration gets a resolver with no declared
+  // settings, which is never read.
+  settings: SettingsResolver;
 }
 
 export type AuthMode =
@@ -55,7 +74,10 @@ export interface IntegrationRoute {
 
 export interface Integration {
   name: string; // registry key, also the status key suffix
-  enabled(env: Env): boolean; // true when its secrets/vars are set
+  // The settings this integration declares, excluding the implicit `habitId` every integration
+  // gets automatically (see src/settings.ts). enabled() is no longer authored here at all — it's
+  // derived generically from these declarations plus habitId.
+  settings: SettingDescriptor[];
   fetchToday(context: SourceContext): Promise<HabitValue[]>;
   routes?: IntegrationRoute[];
 }
