@@ -94,6 +94,17 @@ describe("SettingsResolver secret handling", () => {
   });
 });
 
+// No `default`, unlike NUMBER_SETTING/JSON_SETTING above — used to prove getNumber/getJson still
+// throw when there is truly nothing sensible to fall back to.
+const NUMBER_SETTING_NO_DEFAULT: SettingDescriptor = { key: "limit", type: "number", description: "d" };
+const JSON_SETTING_NO_DEFAULT: SettingDescriptor = { key: "extras", type: "json", description: "d" };
+const SECRET_NUMBER_SETTING_NO_DEFAULT: SettingDescriptor = {
+  key: "secretLimit",
+  type: "number",
+  secret: true,
+  description: "d",
+};
+
 describe("SettingsResolver.getNumber", () => {
   it("parses a resolved numeric string", async () => {
     const testEnv: Env = { ...env, WIDGET_WORDS_PER_PAGE: "300" };
@@ -101,15 +112,31 @@ describe("SettingsResolver.getNumber", () => {
   });
 
   it("returns undefined for an unset optional number setting with no default", async () => {
-    const optionalNumber: SettingDescriptor = { key: "limit", type: "number", description: "d" };
-    expect(await makeResolver({ ...env }, [optionalNumber]).getNumber("limit")).toBeUndefined();
+    expect(await makeResolver({ ...env }, [NUMBER_SETTING_NO_DEFAULT]).getNumber("limit")).toBeUndefined();
   });
 
-  it("throws naming the derived variable when the resolved value isn't numeric", async () => {
-    const testEnv: Env = { ...env, WIDGET_WORDS_PER_PAGE: "not-a-number" };
-    await expect(makeResolver(testEnv, [NUMBER_SETTING]).getNumber("wordsPerPage")).rejects.toThrow(
-      "WIDGET_WORDS_PER_PAGE must be a number",
+  // Matches the pre-resolver behavior every integration relied on (`Number(x) || DEFAULT`): a
+  // malformed value degrades to the declared default rather than failing the whole sync.
+  it("falls back to the default when the resolved value is malformed but a default is declared", async () => {
+    const testEnv: Env = { ...env, WIDGET_WORDS_PER_PAGE: "25o" };
+    expect(await makeResolver(testEnv, [NUMBER_SETTING]).getNumber("wordsPerPage")).toBe(250);
+  });
+
+  it("throws naming the derived variable when the resolved value isn't numeric and there is no default", async () => {
+    const testEnv: Env = { ...env, WIDGET_LIMIT: "not-a-number" };
+    await expect(makeResolver(testEnv, [NUMBER_SETTING_NO_DEFAULT]).getNumber("limit")).rejects.toThrow(
+      "WIDGET_LIMIT must be a number",
     );
+  });
+
+  it("redacts the malformed value in the thrown error when the setting is a secret", async () => {
+    const testEnv: Env = { ...env, WIDGET_SECRET_LIMIT: "super-secret-garbage" };
+    await expect(makeResolver(testEnv, [SECRET_NUMBER_SETTING_NO_DEFAULT]).getNumber("secretLimit")).rejects.toThrow(
+      "[redacted]",
+    );
+    await expect(
+      makeResolver(testEnv, [SECRET_NUMBER_SETTING_NO_DEFAULT]).getNumber("secretLimit"),
+    ).rejects.not.toThrow(/super-secret-garbage/);
   });
 });
 
@@ -123,10 +150,16 @@ describe("SettingsResolver.getJson", () => {
     expect(await makeResolver({ ...env }, [JSON_SETTING]).getJson("pageCounts")).toBeUndefined();
   });
 
-  it("throws naming the derived variable on invalid JSON syntax", async () => {
+  it("falls back to the default when the resolved value is malformed but a default is declared", async () => {
+    const jsonWithDefault: SettingDescriptor = { key: "pageCounts", type: "json", default: "{}", description: "d" };
     const testEnv: Env = { ...env, WIDGET_PAGE_COUNTS: "not json" };
-    await expect(makeResolver(testEnv, [JSON_SETTING]).getJson("pageCounts")).rejects.toThrow(
-      "WIDGET_PAGE_COUNTS must be valid JSON",
+    expect(await makeResolver(testEnv, [jsonWithDefault]).getJson("pageCounts")).toEqual({});
+  });
+
+  it("throws naming the derived variable on invalid JSON syntax and there is no default", async () => {
+    const testEnv: Env = { ...env, WIDGET_EXTRAS: "not json" };
+    await expect(makeResolver(testEnv, [JSON_SETTING_NO_DEFAULT]).getJson("extras")).rejects.toThrow(
+      "WIDGET_EXTRAS must be valid JSON",
     );
   });
 });

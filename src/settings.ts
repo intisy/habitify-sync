@@ -168,32 +168,56 @@ export class SettingsResolver {
     return (await this.resolve(key)).value;
   }
 
-  // Parses the resolved value as the descriptor's declared "number" type. Throws rather than
-  // silently falling back on a non-numeric value, since PUT already validates KV overrides before
-  // they're stored and preflight validates wrangler.toml before deploy — a bad number reaching
-  // here means both checks were bypassed, which is worth surfacing loudly (as a sync-time error)
-  // rather than masking.
+  // Parses the resolved value as the descriptor's declared "number" type. A malformed value falls
+  // back to the descriptor's `default` when one exists — matching the pre-resolver behavior every
+  // integration relied on (`Number(x) || DEFAULT`), and keeping a typo'd wrangler.toml var from
+  // taking the whole integration dark for a day. PUT and preflight are where a bad value is
+  // rejected hard, at write time, which is the right place for that — not here. Only when there is
+  // truly nothing sensible to fall back to (no `default` declared) does this throw.
   async getNumber(key: string): Promise<number | undefined> {
     const resolved = await this.resolve(key);
     if (resolved.value === undefined) return undefined;
     const parsed = Number(resolved.value);
-    if (!Number.isFinite(parsed)) {
-      throw new Error(`${resolved.variableName} must be a number, got ${JSON.stringify(resolved.value)}`);
-    }
-    return parsed;
+    if (Number.isFinite(parsed)) return parsed;
+    const fallback = resolved.descriptor.default !== undefined ? Number(resolved.descriptor.default) : NaN;
+    if (Number.isFinite(fallback)) return fallback;
+    throw new Error(
+      `${resolved.variableName} must be a number, got ${this.describeMalformedValue(resolved)}`,
+    );
   }
 
-  // Parses the resolved value as JSON. Only JSON *syntax* is validated here; a value that parses
-  // but has the wrong shape for a particular setting (e.g. KINDLE_PAGE_COUNTS holding a JSON array
-  // instead of an object) is that integration's own concern, same as before this resolver existed.
+  // Parses the resolved value as JSON, falling back to the descriptor's `default` on malformed
+  // input for the same reason getNumber does above. Only JSON *syntax* is validated here; a value
+  // that parses but has the wrong shape for a particular setting (e.g. KINDLE_PAGE_COUNTS holding
+  // a JSON array instead of an object) is that integration's own concern, same as before this
+  // resolver existed.
   async getJson<T>(key: string): Promise<T | undefined> {
     const resolved = await this.resolve(key);
     if (resolved.value === undefined) return undefined;
     try {
       return JSON.parse(resolved.value) as T;
     } catch (cause) {
-      throw new Error(`${resolved.variableName} must be valid JSON: ${(cause as Error).message}`);
+      if (resolved.descriptor.default !== undefined) {
+        try {
+          return JSON.parse(resolved.descriptor.default) as T;
+        } catch {
+          // The default itself is malformed too (a bug in the descriptor, not the deployment) —
+          // fall through to the throw below rather than silently returning nothing.
+        }
+      }
+      throw new Error(
+        `${resolved.variableName} must be valid JSON: ${
+          resolved.descriptor.secret ? "[redacted]" : (cause as Error).message
+        }`,
+      );
     }
+  }
+
+  // Secrets never get their raw malformed value logged (SourceStatus.lastError is readable via
+  // GET /status) — unreachable today since no secret is typed "number", but cheap insurance
+  // against a future one.
+  private describeMalformedValue(resolved: ResolvedSetting): string {
+    return resolved.descriptor.secret ? "[redacted]" : JSON.stringify(resolved.value);
   }
 
   async resolveAll(): Promise<ResolvedSetting[]> {
