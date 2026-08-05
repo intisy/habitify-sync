@@ -10,11 +10,19 @@ function makeContext(testEnv: Env, fetchFn: typeof fetch): SourceContext {
 const HEADER_SIGNATURE = 0x4b455942;
 const HEADER_VERSION = 2;
 
+interface FixtureHistogramSample {
+  codePoint: number;
+  hitCount: number;
+  missCount: number;
+  timeToType: number;
+}
+
 interface FixtureRecord {
   timestampSeconds: number;
   activeTypingTimeMs: number;
   charactersTyped: number;
   errors: number;
+  samples?: FixtureHistogramSample[];
 }
 
 // A local binary writer mirroring @keybr/binary's Writer (packages/keybr-binary/lib/io.ts) and
@@ -51,14 +59,18 @@ class FixtureWriter {
     return this.putUint32(HEADER_SIGNATURE).putUint32(HEADER_VERSION);
   }
 
-  record({ timestampSeconds, activeTypingTimeMs, charactersTyped, errors }: FixtureRecord): this {
-    return this.putUint8(0) // layout id, unused by this integration
+  record({ timestampSeconds, activeTypingTimeMs, charactersTyped, errors, samples = [] }: FixtureRecord): this {
+    this.putUint8(0) // layout id, unused by this integration
       .putUint8(0) // text type id, unused by this integration
       .putUint32(timestampSeconds)
       .putUintVlq(activeTypingTimeMs)
       .putUintVlq(charactersTyped)
       .putUintVlq(errors)
-      .putUintVlq(0); // zero histogram samples
+      .putUintVlq(samples.length);
+    for (const sample of samples) {
+      this.putUintVlq(sample.codePoint).putUintVlq(sample.hitCount).putUintVlq(sample.missCount).putUintVlq(sample.timeToType);
+    }
+    return this;
   }
 
   rawBytes(...values: number[]): this {
@@ -222,6 +234,120 @@ describe("keybrIntegration", () => {
         },
       },
     ]);
+  });
+
+  it("treats a completely empty (0-byte) body as an empty history, not an error", async () => {
+    // Upstream's own readStructuredContent treats reader.remaining() === 0 as a legitimate empty
+    // case, distinct from a body that's merely too short for the header (1-7 bytes, still an
+    // error). A 0-byte body is what a brand new keybr account with zero completed exercises
+    // would plausibly return.
+    const buffer = new Uint8Array(0);
+    const testEnv: Env = { ...env, KEYBR_PUBLIC_ID: "pub-abc123", HABIT_ID_KEYBR: "habit-k" };
+    const values = await keybrIntegration.fetchToday(makeContext(testEnv, fetchReturning(buffer)));
+
+    expect(values).toEqual([
+      {
+        habitId: "habit-k",
+        value: 0,
+        unit: "min",
+        diagnostics: {
+          lessons: 0,
+          charactersTyped: 0,
+          errors: 0,
+          millisecondsPracticed: 0,
+          totalRecords: 0,
+          truncated: false,
+        },
+      },
+    ]);
+  });
+
+  it("skips a non-empty histogram sample list exactly, keeping the next record aligned", async () => {
+    const writer = new FixtureWriter().header();
+    writer.record({
+      timestampSeconds: berlinEpochSeconds("2026-08-04T09:00:00Z"),
+      activeTypingTimeMs: 40_000,
+      charactersTyped: 90,
+      errors: 4,
+      samples: [
+        { codePoint: 97, hitCount: 12, missCount: 1, timeToType: 180 },
+        // A multi-byte VLQ sample value, to exercise the continuation-byte path inside the
+        // histogram skip itself, not just in the top-level record fields.
+        { codePoint: 98, hitCount: 200_000, missCount: 0, timeToType: 2_000_000 },
+        { codePoint: 99, hitCount: 3, missCount: 2, timeToType: 240 },
+      ],
+    });
+    writer.record({
+      timestampSeconds: berlinEpochSeconds("2026-08-04T10:00:00Z"),
+      activeTypingTimeMs: 55_000,
+      charactersTyped: 130,
+      errors: 6,
+    });
+
+    const testEnv: Env = { ...env, KEYBR_PUBLIC_ID: "pub-abc123", HABIT_ID_KEYBR: "habit-k" };
+    const values = await keybrIntegration.fetchToday(makeContext(testEnv, fetchReturning(writer.buffer())));
+
+    // If the histogram skip consumed the wrong number of bytes, the second record's fields would
+    // be read from the wrong offset — producing garbage totals (or a thrown parse error) instead
+    // of two clean lessons summing exactly 95_000ms and 220 characters. This is the proof that the
+    // skip consumed precisely the right number of bytes for a non-trivial sample count.
+    expect(values[0].diagnostics).toMatchObject({
+      lessons: 2,
+      charactersTyped: 220,
+      errors: 10,
+      millisecondsPracticed: 95_000,
+      totalRecords: 2,
+      truncated: false,
+    });
+  });
+
+  it("uses a DST-aware 23-hour window on Berlin's spring-forward day, not a naive +86400s window", async () => {
+    // Europe/Berlin's local day for 2026-03-29 runs from 2026-03-28T23:00:00Z (local midnight,
+    // still CET/UTC+1) to 2026-03-29T22:00:00Z (the FOLLOWING local midnight, already CEST/UTC+2)
+    // — only 23 hours, because clocks jump forward an hour during this day (see
+    // test/time.test.ts's own spring-forward cases for the same boundary). A naive
+    // `start + 86400 seconds` window would instead end an hour too late, at 2026-03-29T23:00:00Z.
+    const writer = new FixtureWriter().header();
+    // Exactly at the true window's start — must be included (inclusive boundary, nothing dropped).
+    writer.record({
+      timestampSeconds: berlinEpochSeconds("2026-03-28T23:00:00Z"),
+      activeTypingTimeMs: 60_000,
+      charactersTyped: 100,
+      errors: 1,
+    });
+    // Within the true window, close to its true end.
+    writer.record({
+      timestampSeconds: berlinEpochSeconds("2026-03-29T21:30:00Z"),
+      activeTypingTimeMs: 120_000,
+      charactersTyped: 200,
+      errors: 2,
+    });
+    // Past the TRUE end (2026-03-29T22:00:00Z) but still before a naive +86400s end
+    // (2026-03-29T23:00:00Z): this record already belongs to the NEXT local day (2026-03-30) and
+    // must be excluded. A naive fixed-seconds window would wrongly double-count it as today.
+    writer.record({
+      timestampSeconds: berlinEpochSeconds("2026-03-29T22:30:00Z"),
+      activeTypingTimeMs: 999_000,
+      charactersTyped: 900,
+      errors: 90,
+    });
+
+    const testEnv: Env = { ...env, KEYBR_PUBLIC_ID: "pub-abc123", HABIT_ID_KEYBR: "habit-k" };
+    const context: SourceContext = {
+      env: testEnv,
+      timeZone: "Europe/Berlin",
+      today: "2026-03-29",
+      now: new Date("2026-03-29T10:00:00Z"),
+      fetchFn: fetchReturning(writer.buffer()),
+    };
+    const values = await keybrIntegration.fetchToday(context);
+
+    // Only the first two records fall in the true 23-hour window: 60_000 + 120_000 = 180_000ms =
+    // 3 minutes, 2 lessons. Against a naive +86400s window the third record would also be
+    // counted, giving 3 lessons and a much larger, wrong total — so this assertion would fail
+    // under that naive implementation.
+    expect(values[0].value).toBe(3);
+    expect(values[0].diagnostics).toMatchObject({ lessons: 2, totalRecords: 3 });
   });
 
   it("throws a descriptive error for a body shorter than the header", async () => {

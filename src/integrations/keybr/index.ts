@@ -1,4 +1,4 @@
-import { todayInTimeZone } from "../../time";
+import { localMidnightEpochSeconds } from "../../time";
 import type { Env, HabitValue, Integration, SourceContext } from "../types";
 
 const KEYBR_SYNC_DATA_URL = "https://www.keybr.com/_/sync/data";
@@ -126,6 +126,14 @@ interface KeybrHistory {
 // back-to-back with no length prefix or footer (packages/keybr-result-io/lib/file.ts), read until
 // the buffer is exhausted.
 function parseKeybrHistory(buffer: Uint8Array): KeybrHistory {
+  // A zero-byte body is a legitimate empty history (a brand new account with zero completed
+  // exercises yet) — matching upstream's own readStructuredContent, which treats
+  // reader.remaining() === 0 as "nothing to parse" rather than a malformed file. Anything from 1
+  // up to (but not including) the full header length, though, is genuinely too short to be a valid
+  // file and should still throw.
+  if (buffer.byteLength === 0) {
+    return { records: [], truncated: false };
+  }
   if (buffer.byteLength < HEADER_BYTE_LENGTH) {
     throw new Error(
       `keybr history body is ${buffer.byteLength} bytes, shorter than the ${HEADER_BYTE_LENGTH}-byte header`,
@@ -170,7 +178,7 @@ export const keybrIntegration: Integration = {
   },
 
   async fetchToday(context: SourceContext): Promise<HabitValue[]> {
-    const { env, timeZone, today, fetchFn } = context;
+    const { env, timeZone, now, fetchFn } = context;
     const url = `${KEYBR_SYNC_DATA_URL}/${encodeURIComponent(env.KEYBR_PUBLIC_ID!)}`;
     // Deliberately no Authorization or Cookie header: this endpoint is completely unauthenticated
     // (verified against the live site and the linked source) — see the integration's README.
@@ -186,17 +194,32 @@ export const keybrIntegration: Integration = {
     const buffer = new Uint8Array(await response.arrayBuffer());
     const { records, truncated } = parseKeybrHistory(buffer);
 
+    // Precomputed ONCE per sync, not once per record: the local day's bounds as an epoch-second
+    // window, using the same DST-aware helper every other integration uses for day boundaries. A
+    // naive per-record todayInTimeZone comparison would construct an Intl.DateTimeFormat for every
+    // record in the ENTIRE history on every hourly sync — and that history only grows, so it would
+    // get slower every day forever. A numeric range check against two precomputed bounds does not.
+    const startEpochSeconds = localMidnightEpochSeconds(timeZone, now);
+    // The next local midnight, derived from the day AFTER today's local date rather than a flat
+    // +86400 seconds: DST transition days are 23 or 25 hours, not 24, so a fixed offset would
+    // misplace the boundary and either double-count or drop records near midnight on those days.
+    // 26 hours past today's local midnight always lands past tomorrow's start (even on a 25-hour
+    // "fall back" day) and never as far as the day after (every day is at least 23 hours) — so
+    // asking the same DST-aware helper for THAT instant's midnight yields tomorrow's local
+    // midnight exactly, without hand-rolling any offset math ourselves.
+    const endEpochSeconds = localMidnightEpochSeconds(timeZone, new Date((startEpochSeconds + 26 * 3600) * 1000));
+
     let millisecondsPracticed = 0;
     let charactersTyped = 0;
     let errors = 0;
     let lessons = 0;
     for (const record of records) {
+      const recordEpochSeconds = record.timestampMs / 1000;
       // keybr's own "Statistics for Today" panel groups records by the BROWSER's local date. We
-      // deliberately use the worker's configured TIMEZONE instead (via todayInTimeZone, the same
-      // helper every other integration uses for "today"), so the two can disagree by a few hours
-      // near midnight if the account's timezone doesn't match TIMEZONE — that's expected, and
-      // consistent with the rest of this worker rather than a bug.
-      if (todayInTimeZone(timeZone, new Date(record.timestampMs)) !== today) continue;
+      // deliberately use the worker's configured TIMEZONE instead, so the two can disagree by a
+      // few hours near midnight if the account's timezone doesn't match TIMEZONE — that's
+      // expected, and consistent with the rest of this worker rather than a bug.
+      if (recordEpochSeconds < startEpochSeconds || recordEpochSeconds >= endEpochSeconds) continue;
       lessons += 1;
       millisecondsPracticed += record.activeTypingTimeMs;
       charactersTyped += record.charactersTyped;
