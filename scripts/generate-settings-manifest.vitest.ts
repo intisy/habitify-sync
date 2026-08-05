@@ -18,8 +18,12 @@ import { buildSettingsManifest } from "../src/settings";
 
 it("writes scripts/settings-manifest.json from the live registry", () => {
   const manifest = buildSettingsManifest(INTEGRATIONS);
-  // A relative path (resolved against the workers-pool process's cwd, the repo root — this
-  // script is always invoked from there via the npm script) rather than a `new URL(import.meta.url)`
-  // path, which the pool's Node.js fs compat shim mishandles on Windows.
+  // A relative path, resolved against this process's cwd (the repo root — the npm script always
+  // invokes vitest from there). This file deliberately runs under the plain-Node config
+  // (scripts/generators.vitest.config.ts), not the workers pool the rest of the suite uses —
+  // workerd's Node.js fs compat shim is a virtualized, bundle-only mount with no access to the
+  // real project directory, so a write like this fails there no matter what path is given
+  // (confirmed by hand). Plain Node has real disk access, which is the whole reason this file
+  // runs under that separate config instead of the default one.
   writeFileSync("scripts/settings-manifest.json", `${JSON.stringify(manifest, null, 2)}\n`);
 });

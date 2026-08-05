@@ -104,7 +104,10 @@ for (const [integrationName, descriptors] of Object.entries(manifest)) {
 
   // Type validation only applies to what preflight can actually see — secrets live only in
   // Cloudflare, never in a file preflight can read, so they're validated for pairing below but
-  // never for type.
+  // never for type. This number/JSON check is reimplemented from src/index.ts's
+  // settingValidationError (PUT /config's own validation) — this plain-JS script can't import
+  // that TypeScript file (see the header comment above), so keep the two in sync if this logic
+  // changes.
   for (const descriptor of descriptors) {
     const raw = rawByKey[descriptor.key];
     if (descriptor.secret || !raw) continue;

@@ -210,6 +210,8 @@ async function handleGetIntegrationConfig(
 // Validates a raw string value (the shape every wrangler.toml var and every KV override actually
 // is) against a setting's declared type — a `number` must parse finite, a `json` must parse at
 // all — so a bad value is rejected here rather than degrading silently the next time it's read.
+// scripts/preflight.mjs reimplements this same number/JSON check in plain JS (it can't import this
+// file — see its own header comment for why) — keep the two in sync if this logic changes.
 function settingValidationError(descriptor: SettingDescriptor, value: string): string | undefined {
   if (descriptor.type === "number" && !Number.isFinite(Number(value))) {
     return `"${descriptor.key}" must be a number, got ${JSON.stringify(value)}`;

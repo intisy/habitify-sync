@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "test": "vitest run --passWithNoTests && vitest run --config test/settings-manifest.vitest.config.ts",
+    "deploy": "npm run preflight && wrangler deploy",
+    "test": "vitest run --passWithNoTests && vitest run --config test/generated-artifacts.vitest.config.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node-scripts.json",
     "preflight": "node scripts/preflight.mjs",
-    "generate:settings-manifest": "vitest run --config scripts/generate-settings-manifest.vitest.config.ts"
+    "generate:settings-manifest": "vitest run --config scripts/generators.vitest.config.ts scripts/generate-settings-manifest.vitest.ts",
+    "generate:readme-integrations": "vitest run --config scripts/generators.vitest.config.ts scripts/generate-readme-integrations.vitest.ts",
+    "generate": "npm run generate:settings-manifest && npm run generate:readme-integrations"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.12.0",

@@ -3,12 +3,49 @@
 A Cloudflare Worker that runs on an hourly cron, reads today's totals from
 connected services, and writes them into matching [Habitify](https://habitify.me)
 habits. It also exposes a small authenticated HTTP API for triggering a sync
-manually and checking status. It currently ships four integrations:
+manually and checking status.
 
-- **[Strava](src/integrations/strava/README.md)** — activity minutes
-- **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes
-- **[Kindle](src/integrations/kindle/README.md)** — pages read, derived from Amazon's own word-count endpoint (exact using a printed page count discovered automatically from the book's Amazon product page, otherwise a words-per-page estimate)
-- **[keybr](src/integrations/keybr/README.md)** — minutes of active typing time practiced today, parsed from keybr.com's own unauthenticated practice-history endpoint
+Each integration below is linked to its own README (what it logs, setup,
+gotchas). The settings table under each one — including every environment
+variable name and which ones are secret — is generated straight from the
+registry; see [Configuration model](#configuration-model). This block is
+regenerated with `npm run generate:readme-integrations` and a test fails CI
+if it ever drifts from the live registry, so it never needs hand-editing.
+
+<!-- integrations:start -->
+
+### [strava](src/integrations/strava/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `clientId` | `STRAVA_CLIENT_ID` | string | yes | yes | — | Strava OAuth application client id, from strava.com/settings/api. |
+| `clientSecret` | `STRAVA_CLIENT_SECRET` | string | yes | yes | — | Strava OAuth application client secret, from strava.com/settings/api. |
+| `habitId` | `HABIT_ID_STRAVA` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+### [wakatime](src/integrations/wakatime/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `apiKey` | `WAKATIME_API_KEY` | string | yes | yes | — | WakaTime API key, from wakatime.com/settings/api-key. |
+| `habitId` | `HABIT_ID_WAKATIME` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+### [kindle](src/integrations/kindle/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `wordsPerPage` | `KINDLE_WORDS_PER_PAGE` | number | no | no | `250` | Words per printed page, used only when no printed page count is available at all. |
+| `pageCounts` | `KINDLE_PAGE_COUNTS` | json | no | no | — | Optional override mapping asin -> printed page count, for a book whose printed page count Amazon's own product page won't yield. |
+| `positionsPerPage` | `KINDLE_POSITIONS_PER_PAGE` | number | no | no | `1800` | Whispersync positions per printed page, a last-resort fallback when a book's word count is unavailable. |
+| `habitId` | `HABIT_ID_KINDLE` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+### [keybr](src/integrations/keybr/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `publicId` | `KEYBR_PUBLIC_ID` | string | yes | no | — | Public profile id from keybr.com/profile/{id}. Not a secret. |
+| `habitId` | `HABIT_ID_KEYBR` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+<!-- integrations:end -->
 
 ## Forking this
 
@@ -26,10 +63,9 @@ deploy:
 | What | Replace with |
 |---|---|
 | The `[[kv_namespaces]]` `id` in `wrangler.toml` | Your own namespace: `npx wrangler kv namespace create STATE` |
-| Every `HABIT_ID_*` var in `wrangler.toml` (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`, `HABIT_ID_KEYBR`) | Your own Habitify habit ids — once your own worker is deployed, `GET /habits` on it; or directly, `curl -H "X-API-Key: <your Habitify API key>" https://api.habitify.me/v2/habits` |
-| `KEYBR_PUBLIC_ID` in `wrangler.toml` | The id from your own `https://www.keybr.com/profile/{id}` |
 | `TIMEZONE` in `wrangler.toml` | Your own IANA timezone (the committed default, `Europe/Berlin`, is the maintainer's) |
-| The five secrets — `HABITIFY_API_KEY`, `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `WAKATIME_API_KEY`, `ADMIN_TOKEN` | Your own values, each set with `wrangler secret put <NAME>` — see [Setup](#setup) step 5 |
+| The two global secrets — `HABITIFY_API_KEY`, `ADMIN_TOKEN` | Your own values, each set with `wrangler secret put <NAME>` — see [Setup](#setup) step 5 |
+| Every per-integration var and secret (each `HABIT_ID_*`, `KEYBR_PUBLIC_ID`, `STRAVA_CLIENT_ID`/`STRAVA_CLIENT_SECRET`, `WAKATIME_API_KEY`, and so on) | See the settings table under each integration [above](#habitify-sync) — or the live, current values on your own deployed worker at `GET /config` |
 
 `npm run preflight` catches most of a missed replacement — an empty or
 invalid `TIMEZONE`, a wrongly-typed setting (non-numeric where a `number` is
@@ -39,8 +75,8 @@ versa) — before it becomes a rejected deploy or a silently `"disabled"`
 source. It validates every integration's declared settings generically, off
 a generated manifest (`scripts/settings-manifest.json`) rather than a
 hand-written list — see [Configuration model](#configuration-model). It
-cannot check the five secrets, since those live only in Cloudflare, never in
-a file preflight can read.
+cannot check any secret's value, since those live only in Cloudflare, never
+in a file preflight can read.
 
 ## How it works
 
@@ -314,12 +350,15 @@ means adding or removing its directory plus one registry line:
       `[vars]` if you want a committed default; any *secret* setting added
       to `.dev.vars.example` with a dummy value, so `npm run dev` has
       something to read locally
-- [ ] Run `npm run generate:settings-manifest` and commit the result, so
-      `npm run preflight` validates the new settings too
+- [ ] Run `npm run generate` (or the two `generate:*` scripts separately)
+      and commit the result, so `npm run preflight` validates the new
+      settings and this README's generated integrations block (the top of
+      this file, between the `<!-- integrations:start -->` /
+      `<!-- integrations:end -->` markers) both pick it up — neither is
+      hand-edited
 - [ ] If it contributes `routes`, a row per route added to this README's
-      [HTTP API](#http-api) table, and a link to its README added everywhere
-      the other integrations are listed (the top of this README and
-      [Connecting each service](#connecting-each-service)) — skip this
+      [HTTP API](#http-api) table, and a link to its README added to
+      [Connecting each service](#connecting-each-service) — skip this
       entirely if it has no routes of its own
 - [ ] Colocated tests in `src/integrations/<name>/index.test.ts`
 - [ ] A `README.md` in the same directory, following the six-section
@@ -346,7 +385,9 @@ Four pieces of automation live under `.github/`:
   Cloudflare, never in a file preflight can read. The manifest itself is
   generated (`npm run generate:settings-manifest`) and kept honest by
   `test/settings-manifest.test.ts`, which fails if it ever drifts from what
-  `src/integrations/registry.ts` currently declares.
+  `src/integrations/registry.ts` currently declares. This README's own
+  generated integrations block (`npm run generate:readme-integrations`,
+  checked by `test/readme-integrations.test.ts`) is kept honest the same way.
 - **Check** (`.github/workflows/check.yml`) runs `npm run typecheck`,
   `npm test`, and `npm run preflight` on every push to `master` and on every
   pull request. Needs no repository secrets or variables.
@@ -369,7 +410,7 @@ Four pieces of automation live under `.github/`:
   instead of failing, so a fork that hasn't wired up monitoring yet doesn't
   show a false-red workflow.
 - **Deploy** (`.github/workflows/deploy.yml`) runs the typecheck and test
-  suite, then `npx wrangler deploy` — but only on a manual
+  suite, then preflight, then `npx wrangler deploy` — but only on a manual
   `workflow_dispatch`, triggered from the Actions tab, never on push or on
   merge to `master`. This worker is somebody's daily habit tracking; a bad
   merge auto-deploying on push would silently overwrite a live, working
@@ -449,10 +490,12 @@ variables → Actions** in your fork.
 ## Development
 
 ```bash
-npm test                          # vitest run, using @cloudflare/vitest-pool-workers with a real KV binding
-npm run typecheck                 # tsc --noEmit
-npm run preflight                 # validate wrangler.toml — see Continuous integration, monitoring, and deploy
-npm run generate:settings-manifest # regenerate scripts/settings-manifest.json after changing any integration's settings
-npm run dev                       # wrangler dev
-npm run deploy                    # wrangler deploy
+npm test                              # vitest run, using @cloudflare/vitest-pool-workers with a real KV binding
+npm run typecheck                     # tsc --noEmit
+npm run preflight                     # validate wrangler.toml — see Continuous integration, monitoring, and deploy
+npm run generate                      # regenerate both generated artifacts below after changing any integration's settings
+npm run generate:settings-manifest    #   just scripts/settings-manifest.json
+npm run generate:readme-integrations  #   just this README's generated integrations block
+npm run dev                           # wrangler dev
+npm run deploy                        # preflight, then wrangler deploy
 ```
