@@ -8,11 +8,22 @@ Habitify habit configured by `HABIT_ID_STRAVA`. Value is the sum of
 
 ## Configuration
 
-| Key | Kind | Where to get it |
-|---|---|---|
-| `STRAVA_CLIENT_ID` | Secret | Strava API application at [strava.com/settings/api](https://www.strava.com/settings/api) |
-| `STRAVA_CLIENT_SECRET` | Secret | Same Strava API application |
-| `HABIT_ID_STRAVA` | Var (`wrangler.toml`) | `curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits`, or `GET /habits` on the deployed worker |
+Declared in `src/integrations/strava/index.ts` as this integration's
+`settings` (see the root README's
+[Configuration model](../../../README.md#configuration-model) for how a
+declaration turns into an environment variable and how it resolves). Both are
+required and secret, so both live only in Cloudflare, never in `wrangler.toml`
+or the config API.
+
+| Key | Derived variable | Required | Where to get it |
+|---|---|---|---|
+| `clientId` | `STRAVA_CLIENT_ID` | yes | Strava API application at [strava.com/settings/api](https://www.strava.com/settings/api) |
+| `clientSecret` | `STRAVA_CLIENT_SECRET` | yes | Same Strava API application |
+
+`habitId` (`HABIT_ID_STRAVA`) is implicit on every integration — see the
+[Configuration model](../../../README.md#configuration-model). `GET
+/config/strava` shows the live, current value (or `configured` status for the
+two secrets) of every setting listed here.
 
 ## Setup
 

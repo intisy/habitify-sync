@@ -2,6 +2,7 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeEach, describe, expect, it } from "vitest";
 import worker, { handleFetch } from "../../index";
 import { readJson, writeJson } from "../../state";
+import { SettingsResolver } from "../../settings";
 import { AuthNeededError, type Env, type SourceContext } from "../types";
 import { STRAVA_STATE_KEYS, stravaIntegration, type StravaTokens } from "./index";
 
@@ -9,7 +10,8 @@ const now = new Date("2026-08-04T10:00:00Z");
 const berlinMidnightEpoch = Date.parse("2026-08-03T22:00:00Z") / 1000;
 
 function makeContext(testEnv: Env, fetchFn: typeof fetch): SourceContext {
-  return { env: testEnv, timeZone: "Europe/Berlin", today: "2026-08-04", now, fetchFn };
+  const settings = new SettingsResolver(testEnv, testEnv.STATE, "strava", stravaIntegration.settings);
+  return { env: testEnv, timeZone: "Europe/Berlin", today: "2026-08-04", now, fetchFn, settings };
 }
 
 function stravaEnv(): Env {
@@ -21,9 +23,13 @@ describe("stravaIntegration.fetchToday", () => {
     await env.STATE.delete(STRAVA_STATE_KEYS.tokens);
   });
 
-  it("is disabled without client credentials and habit id", () => {
-    expect(stravaIntegration.enabled({ ...env, STRAVA_CLIENT_ID: undefined })).toBe(false);
-    expect(stravaIntegration.enabled(stravaEnv())).toBe(true);
+  it("is disabled without client credentials and habit id", async () => {
+    const missingClientId: Env = { ...stravaEnv(), STRAVA_CLIENT_ID: undefined };
+    expect(await new SettingsResolver(missingClientId, missingClientId.STATE, "strava", stravaIntegration.settings).isEnabled()).toBe(
+      false,
+    );
+    const complete = stravaEnv();
+    expect(await new SettingsResolver(complete, complete.STATE, "strava", stravaIntegration.settings).isEnabled()).toBe(true);
   });
 
   it("throws AuthNeededError when no tokens are stored", async () => {
@@ -134,7 +140,7 @@ describe("GET /strava/callback", () => {
 
     const response = await handleFetch(
       new Request("https://worker.example/strava/callback?code=abc123&state=expected-state"),
-      authedEnv,
+      stravaEnv(),
       fakeFetch,
     );
 

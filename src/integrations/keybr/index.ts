@@ -1,7 +1,16 @@
 import { localMidnightEpochSeconds } from "../../time";
-import type { Env, HabitValue, Integration, SourceContext } from "../types";
+import type { HabitValue, Integration, SettingDescriptor, SourceContext } from "../types";
 
 const KEYBR_SYNC_DATA_URL = "https://www.keybr.com/_/sync/data";
+
+const KEYBR_SETTINGS: SettingDescriptor[] = [
+  {
+    key: "publicId",
+    type: "string",
+    required: true,
+    description: "Public profile id from keybr.com/profile/{id}. Not a secret.",
+  },
+];
 
 // Confirmed from github.com/aradzie/keybr.com packages/keybr-result-io/lib/header.ts.
 const HEADER_SIGNATURE = 0x4b455942; // ASCII "KEYB", written/read as a big-endian uint32.
@@ -172,14 +181,18 @@ function parseKeybrHistory(buffer: Uint8Array): KeybrHistory {
 
 export const keybrIntegration: Integration = {
   name: "keybr",
-
-  enabled(env: Env): boolean {
-    return Boolean(env.KEYBR_PUBLIC_ID && env.HABIT_ID_KEYBR);
-  },
+  settings: KEYBR_SETTINGS,
 
   async fetchToday(context: SourceContext): Promise<HabitValue[]> {
-    const { env, timeZone, now, fetchFn } = context;
-    const url = `${KEYBR_SYNC_DATA_URL}/${encodeURIComponent(env.KEYBR_PUBLIC_ID!)}`;
+    const { timeZone, now, fetchFn, settings } = context;
+    const publicId = await settings.getString("publicId");
+    const habitId = await settings.getString("habitId");
+    // Guaranteed present: fetchToday only runs once SettingsResolver.isEnabled() has confirmed
+    // every required setting resolved non-empty.
+    if (!publicId || !habitId) {
+      throw new Error("keybr is enabled but a required setting resolved empty; this should be unreachable");
+    }
+    const url = `${KEYBR_SYNC_DATA_URL}/${encodeURIComponent(publicId)}`;
     // Deliberately no Authorization or Cookie header: this endpoint is completely unauthenticated
     // (verified against the live site and the linked source) — see the integration's README.
     const response = await fetchFn(url);
@@ -187,7 +200,7 @@ export const keybrIntegration: Integration = {
       if (response.status === 404) {
         // There is no credential here to expire, so a 404 is almost certainly a bad id rather than
         // an auth problem — hence a plain Error (not AuthNeededError) naming the likely cause.
-        throw new Error(`keybr sync data request returned 404; KEYBR_PUBLIC_ID "${env.KEYBR_PUBLIC_ID}" looks wrong`);
+        throw new Error(`keybr sync data request returned 404; KEYBR_PUBLIC_ID "${publicId}" looks wrong`);
       }
       throw new Error(`keybr sync data request failed with status ${response.status}`);
     }
@@ -227,7 +240,7 @@ export const keybrIntegration: Integration = {
     }
 
     const habitValue: HabitValue = {
-      habitId: env.HABIT_ID_KEYBR!,
+      habitId,
       // Rounded once, at the end, from the summed milliseconds — never per record.
       value: Math.round(millisecondsPracticed / 60000),
       unit: "min",

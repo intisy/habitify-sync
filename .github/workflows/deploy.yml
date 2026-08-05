@@ -23,6 +23,7 @@ jobs:
       # Never ship a version that does not pass its own checks.
       - run: npm run typecheck
       - run: npm test
+      - run: npm run preflight
 
       # Entirely optional: deploying from a developer machine works without any
       # API token, because `wrangler login` holds an OAuth session there. A

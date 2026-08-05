@@ -2,6 +2,7 @@ import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:
 import { beforeEach, describe, expect, it } from "vitest";
 import worker, { handleFetch } from "../../index";
 import { readJson, writeJson } from "../../state";
+import { SettingsResolver } from "../../settings";
 import { AuthNeededError, type Env, type HabitValue, type SourceContext } from "../types";
 import { KINDLE_STATE_KEYS, kindleIntegration, type KindlePositions, type KindleSession } from "./index";
 
@@ -50,8 +51,12 @@ const DEEP_WORK = { asin: "ASINDEEPWORK01", startPosition: 3, endPosition: 45617
 const C_PROGRAMMING_LANGUAGE = { asin: "ASINCPROGLANG1", startPosition: 3, endPosition: 563246, position: 238526 };
 const ESV_BIBLE = { asin: "ASINESVBIBLE01", startPosition: 3, endPosition: 6960680, position: 5238294 };
 
+function makeSettings(testEnv: Env): SettingsResolver {
+  return new SettingsResolver(testEnv, testEnv.STATE, "kindle", kindleIntegration.settings);
+}
+
 function makeContext(testEnv: Env, fetchFn: typeof fetch, today = "2026-08-04"): SourceContext {
-  return { env: testEnv, timeZone: "Europe/Berlin", today, now: new Date(`${today}T10:00:00Z`), fetchFn };
+  return { env: testEnv, timeZone: "Europe/Berlin", today, now: new Date(`${today}T10:00:00Z`), fetchFn, settings: makeSettings(testEnv) };
 }
 
 function kindleEnv(overrides: Partial<Env> = {}): Env {
@@ -81,11 +86,11 @@ beforeEach(async () => {
   await env.STATE.delete(KINDLE_STATE_KEYS.positions);
 });
 
-describe("kindleIntegration.enabled", () => {
-  it("is false without HABIT_ID_KINDLE and true with it", () => {
-    expect(kindleIntegration.enabled({ ...env, HABIT_ID_KINDLE: undefined })).toBe(false);
-    expect(kindleIntegration.enabled({ ...env, HABIT_ID_KINDLE: "" })).toBe(false);
-    expect(kindleIntegration.enabled(kindleEnv())).toBe(true);
+describe("kindleIntegration settings.isEnabled", () => {
+  it("is false without HABIT_ID_KINDLE and true with it", async () => {
+    expect(await makeSettings({ ...env, HABIT_ID_KINDLE: undefined }).isEnabled()).toBe(false);
+    expect(await makeSettings({ ...env, HABIT_ID_KINDLE: "" }).isEnabled()).toBe(false);
+    expect(await makeSettings(kindleEnv()).isEnabled()).toBe(true);
   });
 });
 
@@ -408,6 +413,24 @@ describe("kindleIntegration.fetchToday - page delta math and baseline lifecycle"
     );
     // Guarded to 1 position/page, so this is 3600 pages, not a negative or otherwise bogus number.
     expect(values).toEqual([expect.objectContaining({ value: 3600 })]);
+  });
+
+  it("falls back to the declared default, still producing a value, when KINDLE_POSITIONS_PER_PAGE is malformed", async () => {
+    await writeJson(env.STATE, KINDLE_STATE_KEYS.positions, {
+      date: "2026-08-04",
+      positions: { ASIN1: 1000 },
+      estimated: false,
+    } satisfies KindlePositions);
+
+    // A typo like this must degrade to the default (1800/page), not fail the whole sync — the
+    // integration should still log a value today, exactly as it did before this setting was
+    // read through the resolver.
+    const fetchFn = fetchForPositions({ ASIN1: 1000 + 3600 });
+    const values = await kindleIntegration.fetchToday(
+      makeContext(kindleEnv({ KINDLE_POSITIONS_PER_PAGE: "25o" }), fetchFn),
+    );
+    // delta 3600 / default 1800 = 2 pages, same as the "no override" default case.
+    expect(values).toEqual([expect.objectContaining({ value: 2 })]);
   });
 
   it("sums fractional per-book estimates before rounding once at the end", async () => {

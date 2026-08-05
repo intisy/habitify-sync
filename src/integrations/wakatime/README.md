@@ -7,10 +7,17 @@ habit configured by `HABIT_ID_WAKATIME`.
 
 ## Configuration
 
-| Key | Kind | Where to get it |
-|---|---|---|
-| `WAKATIME_API_KEY` | Secret | [wakatime.com/settings/api-key](https://wakatime.com/settings/api-key) |
-| `HABIT_ID_WAKATIME` | Var (`wrangler.toml`) | `curl -H "X-API-Key: <HABITIFY_API_KEY>" https://api.habitify.me/v2/habits`, or `GET /habits` on the deployed worker |
+Declared in `src/integrations/wakatime/index.ts` as this integration's
+`settings` (see the root README's
+[Configuration model](../../../README.md#configuration-model)).
+
+| Key | Derived variable | Required | Where to get it |
+|---|---|---|---|
+| `apiKey` | `WAKATIME_API_KEY` | yes (secret) | [wakatime.com/settings/api-key](https://wakatime.com/settings/api-key) |
+
+`habitId` (`HABIT_ID_WAKATIME`) is implicit on every integration — see the
+[Configuration model](../../../README.md#configuration-model). `GET
+/config/wakatime` shows the live, current state of both.
 
 ## Setup
 

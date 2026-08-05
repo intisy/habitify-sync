@@ -1,6 +1,7 @@
 import { HabitifyClient, isHabitifyUnitSymbol, type HabitifyUnitSymbol } from "./habitify";
 import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "./state";
 import { AuthNeededError, type Env, type HabitValue, type Integration, type SourceContext } from "./integrations/types";
+import { SettingsResolver } from "./settings";
 import { todayInTimeZone } from "./time";
 
 const DEFAULT_TIME_ZONE = "Europe/Berlin";
@@ -53,7 +54,7 @@ export async function runSync(
   onlySource?: string,
 ): Promise<SyncResult[]> {
   const timeZone = env.TIMEZONE || DEFAULT_TIME_ZONE;
-  const context: SourceContext = { env, timeZone, today: todayInTimeZone(timeZone, now), now, fetchFn };
+  const today = todayInTimeZone(timeZone, now);
   const results: SyncResult[] = [];
 
   // Without this, a missing key would make every enabled source fail with a 401 buried in
@@ -95,7 +96,8 @@ export async function runSync(
   for (const source of sources) {
     if (onlySource && source.name !== onlySource) continue;
     const previous = await readJson<SourceStatus>(env.STATE, STATE_KEYS.sourceStatus(source.name));
-    if (!source.enabled(env)) {
+    const settings = new SettingsResolver(env, env.STATE, source.name, source.settings);
+    if (!(await settings.isEnabled())) {
       // Carry lastSuccessAt forward so unsetting a secret doesn't erase when the source last worked.
       const disabledStatus: SourceStatus = { state: "disabled", lastSuccessAt: previous?.lastSuccessAt };
       await writeJson(env.STATE, STATE_KEYS.sourceStatus(source.name), disabledStatus);
@@ -103,6 +105,7 @@ export async function runSync(
       continue;
     }
 
+    const context: SourceContext = { env, timeZone, today, now, fetchFn, settings };
     let status: SourceStatus;
     try {
       const values = await source.fetchToday(context);

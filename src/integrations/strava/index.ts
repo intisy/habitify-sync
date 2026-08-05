@@ -6,12 +6,30 @@ import {
   type HabitValue,
   type Integration,
   type RouteContext,
+  type SettingDescriptor,
   type SourceContext,
 } from "../types";
 
 const STRAVA_AUTHORIZE_URL = "https://www.strava.com/oauth/authorize";
 const STRAVA_TOKEN_URL = "https://www.strava.com/api/v3/oauth/token";
 const STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities";
+
+const STRAVA_SETTINGS: SettingDescriptor[] = [
+  {
+    key: "clientId",
+    type: "string",
+    secret: true,
+    required: true,
+    description: "Strava OAuth application client id, from strava.com/settings/api.",
+  },
+  {
+    key: "clientSecret",
+    type: "string",
+    secret: true,
+    required: true,
+    description: "Strava OAuth application client secret, from strava.com/settings/api.",
+  },
+];
 
 // This integration's own KV keys — not shared generic state.
 export const STRAVA_STATE_KEYS = {
@@ -41,20 +59,27 @@ function mapTokenResponse(body: StravaTokenResponse): StravaTokens {
 
 // Strava documents (and OAuth 2.0 requires) form-urlencoded token requests; URLSearchParams
 // sets the Content-Type header itself, so it must not be set manually here.
-function requestStravaToken(env: Env, fetchFn: typeof fetch, grantParams: Record<string, string>): Promise<Response> {
+function requestStravaToken(
+  clientId: string,
+  clientSecret: string,
+  fetchFn: typeof fetch,
+  grantParams: Record<string, string>,
+): Promise<Response> {
   return fetchFn(STRAVA_TOKEN_URL, {
     method: "POST",
-    body: new URLSearchParams({
-      client_id: env.STRAVA_CLIENT_ID ?? "",
-      client_secret: env.STRAVA_CLIENT_SECRET ?? "",
-      ...grantParams,
-    }),
+    body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, ...grantParams }),
   });
 }
 
 // Strava rotates refresh tokens on every refresh, so the new one must be persisted.
-async function refreshTokens(env: Env, fetchFn: typeof fetch, tokens: StravaTokens): Promise<StravaTokens> {
-  const response = await requestStravaToken(env, fetchFn, {
+async function refreshTokens(
+  env: Env,
+  clientId: string,
+  clientSecret: string,
+  fetchFn: typeof fetch,
+  tokens: StravaTokens,
+): Promise<StravaTokens> {
+  const response = await requestStravaToken(clientId, clientSecret, fetchFn, {
     grant_type: "refresh_token",
     refresh_token: tokens.refreshToken,
   });
@@ -71,8 +96,14 @@ async function refreshTokens(env: Env, fetchFn: typeof fetch, tokens: StravaToke
 
 // Performs the one-time authorization_code exchange after the user completes Strava's consent
 // screen, and persists the resulting tokens the same way refreshTokens does.
-export async function exchangeStravaCode(env: Env, fetchFn: typeof fetch, code: string): Promise<StravaTokens> {
-  const response = await requestStravaToken(env, fetchFn, { grant_type: "authorization_code", code });
+export async function exchangeStravaCode(
+  env: Env,
+  clientId: string,
+  clientSecret: string,
+  fetchFn: typeof fetch,
+  code: string,
+): Promise<StravaTokens> {
+  const response = await requestStravaToken(clientId, clientSecret, fetchFn, { grant_type: "authorization_code", code });
   if (!response.ok) {
     throw new Error(`Strava code exchange failed with status ${response.status}`);
   }
@@ -82,14 +113,15 @@ export async function exchangeStravaCode(env: Env, fetchFn: typeof fetch, code: 
 }
 
 async function handleAuthorize(request: Request, context: RouteContext): Promise<Response> {
-  const { env } = context;
-  if (!env.STRAVA_CLIENT_ID) {
+  const { env, settings } = context;
+  const clientId = await settings.getString("clientId");
+  if (!clientId) {
     return Response.json({ error: "STRAVA_CLIENT_ID is not configured" }, { status: 500 });
   }
   const state = crypto.randomUUID();
   await env.STATE.put(STRAVA_STATE_KEYS.oauthState, state, { expirationTtl: 600 });
   const redirect = new URL(STRAVA_AUTHORIZE_URL);
-  redirect.searchParams.set("client_id", env.STRAVA_CLIENT_ID);
+  redirect.searchParams.set("client_id", clientId);
   redirect.searchParams.set("redirect_uri", `${new URL(request.url).origin}/strava/callback`);
   redirect.searchParams.set("response_type", "code");
   redirect.searchParams.set("scope", "activity:read_all");
@@ -98,7 +130,7 @@ async function handleAuthorize(request: Request, context: RouteContext): Promise
 }
 
 async function handleCallback(request: Request, context: RouteContext): Promise<Response> {
-  const { env, fetchFn } = context;
+  const { env, fetchFn, settings } = context;
   const url = new URL(request.url);
   const expectedState = await env.STATE.get(STRAVA_STATE_KEYS.oauthState);
   if (!expectedState || url.searchParams.get("state") !== expectedState) {
@@ -108,8 +140,13 @@ async function handleCallback(request: Request, context: RouteContext): Promise<
   if (!code) {
     return Response.json({ error: "missing code parameter" }, { status: 400 });
   }
+  const clientId = await settings.getString("clientId");
+  const clientSecret = await settings.getString("clientSecret");
+  if (!clientId || !clientSecret) {
+    return Response.json({ error: "STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET are not configured" }, { status: 500 });
+  }
   try {
-    await exchangeStravaCode(env, fetchFn, code);
+    await exchangeStravaCode(env, clientId, clientSecret, fetchFn, code);
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 502 });
   }
@@ -119,20 +156,26 @@ async function handleCallback(request: Request, context: RouteContext): Promise<
 
 export const stravaIntegration: Integration = {
   name: "strava",
-
-  enabled(env: Env): boolean {
-    return Boolean(env.STRAVA_CLIENT_ID && env.STRAVA_CLIENT_SECRET && env.HABIT_ID_STRAVA);
-  },
+  settings: STRAVA_SETTINGS,
 
   async fetchToday(context: SourceContext): Promise<HabitValue[]> {
-    const { env, timeZone, now, fetchFn } = context;
+    const { env, timeZone, now, fetchFn, settings } = context;
+    const clientId = await settings.getString("clientId");
+    const clientSecret = await settings.getString("clientSecret");
+    // Guaranteed present: fetchToday only runs once SettingsResolver.isEnabled() has confirmed
+    // every required setting (both secrets included) resolved non-empty.
+    const habitId = await settings.getString("habitId");
+    if (!clientId || !clientSecret || !habitId) {
+      throw new Error("strava is enabled but a required setting resolved empty; this should be unreachable");
+    }
+
     let tokens = await readJson<StravaTokens>(env.STATE, STRAVA_STATE_KEYS.tokens);
     if (!tokens) {
       throw new AuthNeededError("Strava is not authorized yet; open /strava/authorize");
     }
     const nowEpoch = Math.floor(now.getTime() / 1000);
     if (tokens.expiresAt <= nowEpoch + 60) {
-      tokens = await refreshTokens(env, fetchFn, tokens);
+      tokens = await refreshTokens(env, clientId, clientSecret, fetchFn, tokens);
     }
     const after = localMidnightEpochSeconds(timeZone, now);
     const response = await fetchFn(`${STRAVA_ACTIVITIES_URL}?after=${after}&per_page=100`, {
@@ -149,7 +192,7 @@ export const stravaIntegration: Integration = {
       throw new Error("Strava returned an unexpected payload shape");
     }
     const totalSeconds = activities.reduce((sum, activity) => sum + activity.moving_time, 0);
-    return [{ habitId: env.HABIT_ID_STRAVA!, value: Math.round(totalSeconds / 60), unit: "min" }];
+    return [{ habitId, value: Math.round(totalSeconds / 60), unit: "min" }];
   },
 
   routes: [

@@ -3,12 +3,49 @@
 A Cloudflare Worker that runs on an hourly cron, reads today's totals from
 connected services, and writes them into matching [Habitify](https://habitify.me)
 habits. It also exposes a small authenticated HTTP API for triggering a sync
-manually and checking status. It currently ships four integrations:
+manually and checking status.
 
-- **[Strava](src/integrations/strava/README.md)** — activity minutes
-- **[WakaTime](src/integrations/wakatime/README.md)** — coding minutes
-- **[Kindle](src/integrations/kindle/README.md)** — pages read, derived from Amazon's own word-count endpoint (exact using a printed page count discovered automatically from the book's Amazon product page, otherwise a words-per-page estimate)
-- **[keybr](src/integrations/keybr/README.md)** — minutes of active typing time practiced today, parsed from keybr.com's own unauthenticated practice-history endpoint
+Each integration below is linked to its own README (what it logs, setup,
+gotchas). The settings table under each one — including every environment
+variable name and which ones are secret — is generated straight from the
+registry; see [Configuration model](#configuration-model). This block is
+regenerated with `npm run generate:readme-integrations` and a test fails CI
+if it ever drifts from the live registry, so it never needs hand-editing.
+
+<!-- integrations:start -->
+
+### [strava](src/integrations/strava/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `clientId` | `STRAVA_CLIENT_ID` | string | yes | yes | — | Strava OAuth application client id, from strava.com/settings/api. |
+| `clientSecret` | `STRAVA_CLIENT_SECRET` | string | yes | yes | — | Strava OAuth application client secret, from strava.com/settings/api. |
+| `habitId` | `HABIT_ID_STRAVA` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+### [wakatime](src/integrations/wakatime/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `apiKey` | `WAKATIME_API_KEY` | string | yes | yes | — | WakaTime API key, from wakatime.com/settings/api-key. |
+| `habitId` | `HABIT_ID_WAKATIME` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+### [kindle](src/integrations/kindle/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `wordsPerPage` | `KINDLE_WORDS_PER_PAGE` | number | no | no | `250` | Words per printed page, used only when no printed page count is available at all. |
+| `pageCounts` | `KINDLE_PAGE_COUNTS` | json | no | no | — | Optional override mapping asin -> printed page count, for a book whose printed page count Amazon's own product page won't yield. |
+| `positionsPerPage` | `KINDLE_POSITIONS_PER_PAGE` | number | no | no | `1800` | Whispersync positions per printed page, a last-resort fallback when a book's word count is unavailable. |
+| `habitId` | `HABIT_ID_KINDLE` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+### [keybr](src/integrations/keybr/README.md)
+
+| Key | Derived variable | Type | Required | Secret | Default | Description |
+|---|---|---|---|---|---|---|
+| `publicId` | `KEYBR_PUBLIC_ID` | string | yes | no | — | Public profile id from keybr.com/profile/{id}. Not a secret. |
+| `habitId` | `HABIT_ID_KEYBR` | string | yes | no | — | Habitify habit id this integration logs into. |
+
+<!-- integrations:end -->
 
 ## Forking this
 
@@ -26,17 +63,20 @@ deploy:
 | What | Replace with |
 |---|---|
 | The `[[kv_namespaces]]` `id` in `wrangler.toml` | Your own namespace: `npx wrangler kv namespace create STATE` |
-| Every `HABIT_ID_*` var in `wrangler.toml` (`HABIT_ID_STRAVA`, `HABIT_ID_WAKATIME`, `HABIT_ID_KINDLE`, `HABIT_ID_KEYBR`) | Your own Habitify habit ids — once your own worker is deployed, `GET /habits` on it; or directly, `curl -H "X-API-Key: <your Habitify API key>" https://api.habitify.me/v2/habits` |
-| `KEYBR_PUBLIC_ID` in `wrangler.toml` | The id from your own `https://www.keybr.com/profile/{id}` |
 | `TIMEZONE` in `wrangler.toml` | Your own IANA timezone (the committed default, `Europe/Berlin`, is the maintainer's) |
-| The five secrets — `HABITIFY_API_KEY`, `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, `WAKATIME_API_KEY`, `ADMIN_TOKEN` | Your own values, each set with `wrangler secret put <NAME>` — see [Setup](#setup) step 5 |
+| The two global secrets — `HABITIFY_API_KEY`, `ADMIN_TOKEN` | Your own values, each set with `wrangler secret put <NAME>` — see [Setup](#setup) step 5 |
+| Every per-integration var and secret (each `HABIT_ID_*`, `KEYBR_PUBLIC_ID`, `STRAVA_CLIENT_ID`/`STRAVA_CLIENT_SECRET`, `WAKATIME_API_KEY`, and so on) | See the settings table under each integration [above](#habitify-sync) — or the live, current values on your own deployed worker at `GET /config` |
 
 `npm run preflight` catches most of a missed replacement — an empty or
-invalid `TIMEZONE`, malformed `KINDLE_PAGE_COUNTS` JSON, an integration
-that's half-configured (a habit id set without its other required vars, or
-vice versa) — before it becomes a rejected deploy or a silently `"disabled"`
-source. It cannot check the five secrets, since those live only in
-Cloudflare, never in a file preflight can read.
+invalid `TIMEZONE`, a wrongly-typed setting (non-numeric where a `number` is
+declared, unparseable `KINDLE_PAGE_COUNTS` JSON), an integration that's
+half-configured (a habit id set without its other required vars, or vice
+versa) — before it becomes a rejected deploy or a silently `"disabled"`
+source. It validates every integration's declared settings generically, off
+a generated manifest (`scripts/settings-manifest.json`) rather than a
+hand-written list — see [Configuration model](#configuration-model). It
+cannot check any secret's value, since those live only in Cloudflare, never
+in a file preflight can read.
 
 ## How it works
 
@@ -50,6 +90,42 @@ An integration can also contribute HTTP routes (for an OAuth handshake, for
 example) and its own KV state, entirely inside its own directory —
 `src/index.ts` and `src/state.ts` hold no integration-specific knowledge. See
 [Adding a new integration](#adding-a-new-integration) below.
+
+## Configuration model
+
+Every setting an integration accepts — a habit id, a secret, a plain var — is
+declared once, in that integration's own file, as a `SettingDescriptor` (see
+`src/integrations/types.ts`):
+
+```ts
+{ key: "wordsPerPage", type: "number", default: "250", description: "..." }
+```
+
+Nothing else is hand-written from there:
+
+- **The environment variable name is derived, never written down twice.** It's
+  `<INTEGRATION>_<KEY_AS_SCREAMING_SNAKE>` — `kindle`'s `wordsPerPage` becomes
+  `KINDLE_WORDS_PER_PAGE`. Every integration also implicitly gets a `habitId`
+  setting (no need to declare it), which reverses the pattern to
+  `HABIT_ID_<INTEGRATION>` to match the vars this worker has always used.
+- **Resolution** goes KV override → environment (`wrangler.toml` var or
+  secret) → the descriptor's `default`, highest precedence first. Integrations
+  read their own settings through a resolver (`context.settings.getString(...)`
+  / `getNumber(...)` / `getJson(...)`) rather than touching `env` directly, so
+  a setting can never be read under a name nobody declared.
+- **Secrets are environment-only.** A setting marked `secret: true` never
+  reads from KV, is never returned by the config API, and is never settable
+  through it — only `wrangler secret put` (production) or `.dev.vars` (local)
+  ever set one.
+- **`enabled()` is derived, not authored.** An integration is enabled when
+  every `required` setting (its own declarations plus the implicit `habitId`)
+  resolves to a non-empty value — computed the same way for every
+  integration, in one place (`src/settings.ts`).
+
+`GET /config` is the live, always-current source of truth for what every
+integration accepts and how each setting currently resolves — see
+[HTTP API](#http-api) below. It's generated straight from the declarations
+above, so it can never go stale the way a hand-written table would.
 
 Each integration runs inside its own `try`/`catch`, so one integration
 failing (an expired Strava token, a WakaTime outage) never blocks the
@@ -194,6 +270,10 @@ one-time setup steps (OAuth consent, callback domains, and the like):
 | `GET /habits?raw=1` | `admin` | Same route, untrimmed — full Habitify habit objects (scheduling, area, time-of-day, archived flag, etc.), for diagnosing what Habitify actually stores versus what the app displays |
 | `POST /habits` | `admin` | Create a new Habitify habit, so one exists to log into before `wrangler.toml` is filled in |
 | `GET /journal` (optional `?date=YYYY-MM-DD`) | `admin` | The day-by-day journal view Habitify's own app renders for a date, for diagnosing what Habitify actually stores versus what the app displays |
+| `GET /config` | `admin` | Every integration's settings: value, source (`kv`/`env`/`default`), default, type, description — secrets redacted to `configured: true\|false` |
+| `GET /config/<integration>` | `admin` | Same, for one integration |
+| `PUT /config/<integration>` | `admin` | Merge KV overrides into an integration's settings — body is a JSON object of key → string value. Rejects unknown keys and secret keys, and validates `number`/`json` typed values, each with a clear error naming what's allowed |
+| `DELETE /config/<integration>` (optional `?key=`) | `admin` | Clear all of an integration's KV overrides, or just one with `?key=` |
 | `GET /strava/authorize` | `admin-or-query-token` | Start the one-time Strava OAuth flow ([details](src/integrations/strava/README.md#routes)) |
 | `GET /strava/callback` | `public` | Finishes the Strava OAuth exchange ([details](src/integrations/strava/README.md#routes)) |
 | `PUT /kindle/session` | `admin` | Store the captured Kindle session ([details](src/integrations/kindle/README.md#routes)) |
@@ -226,6 +306,17 @@ curl -X POST "https://<worker-url>/habits" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name": "Read", "goal": {"periodicity": "daily", "value": 10, "unit": "rep"}}'
+
+curl "https://<worker-url>/config/keybr" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+curl -X PUT "https://<worker-url>/config/keybr" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"publicId": "your-new-id"}'
+
+curl -X DELETE "https://<worker-url>/config/keybr?key=publicId" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
 ## Adding a new integration
@@ -236,49 +327,46 @@ The `Integration` interface is the extension point
 ```ts
 export interface Integration {
   name: string;
-  enabled(env: Env): boolean;
+  settings: SettingDescriptor[];
   fetchToday(context: SourceContext): Promise<HabitValue[]>;
   routes?: IntegrationRoute[];
 }
 ```
 
-Adding or removing an integration means adding or removing its directory
-plus one registry line — the same recipe whether it's a plain key-based
-integration or one with its own OAuth routes and KV state:
+Declaring `settings` (see [Configuration model](#configuration-model) above)
+is what replaced most of this checklist: there's no `Env` field to add, no
+`enabled()` to write, and nothing to register in preflight — all three are
+now derived from the declaration itself. Adding or removing an integration
+means adding or removing its directory plus one registry line:
 
 - [ ] New directory `src/integrations/<name>/` with an `index.ts`
-      implementing `Integration` (add a `routes` array only if it needs
-      HTTP endpoints of its own — an OAuth authorize/callback pair, say —
-      and declare any KV keys it owns right there in the same file)
+      implementing `Integration` — declare its `settings` (its own vars;
+      `habitId` is implicit, never declared per integration), add a
+      `routes` array only if it needs HTTP endpoints of its own (an OAuth
+      authorize/callback pair, say), and declare any KV keys it owns right
+      there in the same file
 - [ ] One entry added to `INTEGRATIONS` in `src/integrations/registry.ts`
-- [ ] **Every** field it reads off `env` — its `HABIT_ID_<NAME>` included,
-      not just an integration-specific var like `KEYBR_PUBLIC_ID` — added to
-      the `Env` interface in `src/integrations/types.ts`. It's easy to add
-      the var to `wrangler.toml` and forget `Env`; `env.HABIT_ID_<NAME>`
-      simply won't compile until it's there.
-- [ ] Its `HABIT_ID_<NAME>` var, and any other plain vars it needs (e.g.
-      `KEYBR_PUBLIC_ID`), added to `wrangler.toml`'s `[vars]`
-- [ ] Any *secret* it needs (set via `wrangler secret put`, never a plain
-      var) added to `.dev.vars.example` with a dummy value, so `npm run dev`
-      has something to read locally. A plain var does **not** go in
-      `.dev.vars.example` — it lives only in `wrangler.toml`, which
-      `wrangler dev` reads directly. keybr needs no secret at all, so it
-      added nothing here.
-- [ ] Registered in the `integrations` list in `scripts/preflight.mjs`
-      (habit-id var, any extra vars it depends on, any secrets), so
-      `npm run preflight` can catch it being half-configured
+- [ ] Its non-secret settings' derived vars added to `wrangler.toml`'s
+      `[vars]` if you want a committed default; any *secret* setting added
+      to `.dev.vars.example` with a dummy value, so `npm run dev` has
+      something to read locally
+- [ ] Run `npm run generate` (or the two `generate:*` scripts separately)
+      and commit the result, so `npm run preflight` validates the new
+      settings and this README's generated integrations block (the top of
+      this file, between the `<!-- integrations:start -->` /
+      `<!-- integrations:end -->` markers) both pick it up — neither is
+      hand-edited
 - [ ] If it contributes `routes`, a row per route added to this README's
-      [HTTP API](#http-api) table, and a link to its README added everywhere
-      the other integrations are listed (the top of this README and
-      [Connecting each service](#connecting-each-service)) — keybr needed
-      neither, since it has no routes of its own
+      [HTTP API](#http-api) table, and a link to its README added to
+      [Connecting each service](#connecting-each-service) — skip this
+      entirely if it has no routes of its own
 - [ ] Colocated tests in `src/integrations/<name>/index.test.ts`
 - [ ] A `README.md` in the same directory, following the six-section
       structure the existing integrations use (what it logs, configuration,
       setup, routes, stored state, gotchas)
 
-No other file needs to change — `src/index.ts` builds its route table from
-`INTEGRATIONS` plus its own core routes, and it, `src/state.ts`, and
+No other file needs to change — `src/index.ts` builds its route table and
+its `/config/*` routes from `INTEGRATIONS`, and it, `src/state.ts`, and
 `src/sync.ts` hold no integration-specific knowledge.
 
 ## Continuous integration, monitoring, and deploy
@@ -288,11 +376,18 @@ Four pieces of automation live under `.github/`:
 - **`npm run preflight`** (`scripts/preflight.mjs`) statically checks
   `wrangler.toml` before you deploy: that the `STATE` KV `id` is present and
   isn't the old placeholder, that `TIMEZONE` (if set) is a zone `Intl`
-  recognizes, that `KINDLE_PAGE_COUNTS` (if set) is valid JSON shaped as
-  `{"asin": pages}`, and that each integration has its habit id and every
-  other var it needs set together, rather than half-configured (a habit id
-  with no `KEYBR_PUBLIC_ID`, say). It cannot check secrets — those live only
-  in Cloudflare, never in a file preflight can read.
+  recognizes, and — generically, off `scripts/settings-manifest.json` (see
+  [Configuration model](#configuration-model)) — that every declared
+  `number` setting parses as a number, every declared `json` setting parses
+  as JSON, and each integration has its habit id and every other required
+  var set together rather than half-configured (a habit id with no
+  `KEYBR_PUBLIC_ID`, say). It cannot check secrets — those live only in
+  Cloudflare, never in a file preflight can read. The manifest itself is
+  generated (`npm run generate:settings-manifest`) and kept honest by
+  `test/settings-manifest.test.ts`, which fails if it ever drifts from what
+  `src/integrations/registry.ts` currently declares. This README's own
+  generated integrations block (`npm run generate:readme-integrations`,
+  checked by `test/readme-integrations.test.ts`) is kept honest the same way.
 - **Check** (`.github/workflows/check.yml`) runs `npm run typecheck`,
   `npm test`, and `npm run preflight` on every push to `master` and on every
   pull request. Needs no repository secrets or variables.
@@ -315,7 +410,7 @@ Four pieces of automation live under `.github/`:
   instead of failing, so a fork that hasn't wired up monitoring yet doesn't
   show a false-red workflow.
 - **Deploy** (`.github/workflows/deploy.yml`) runs the typecheck and test
-  suite, then `npx wrangler deploy` — but only on a manual
+  suite, then preflight, then `npx wrangler deploy` — but only on a manual
   `workflow_dispatch`, triggered from the Actions tab, never on push or on
   merge to `master`. This worker is somebody's daily habit tracking; a bad
   merge auto-deploying on push would silently overwrite a live, working
@@ -395,9 +490,12 @@ variables → Actions** in your fork.
 ## Development
 
 ```bash
-npm test          # vitest run, using @cloudflare/vitest-pool-workers with a real KV binding
-npm run typecheck # tsc --noEmit
-npm run preflight # validate wrangler.toml — see Continuous integration, monitoring, and deploy
-npm run dev       # wrangler dev
-npm run deploy    # wrangler deploy
+npm test                              # vitest run, using @cloudflare/vitest-pool-workers with a real KV binding
+npm run typecheck                     # tsc --noEmit
+npm run preflight                     # validate wrangler.toml — see Continuous integration, monitoring, and deploy
+npm run generate                      # regenerate both generated artifacts below after changing any integration's settings
+npm run generate:settings-manifest    #   just scripts/settings-manifest.json
+npm run generate:readme-integrations  #   just this README's generated integrations block
+npm run dev                           # wrangler dev
+npm run deploy                        # preflight, then wrangler deploy
 ```
