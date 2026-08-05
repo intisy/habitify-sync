@@ -6,12 +6,14 @@ export interface Env {
   HABIT_ID_STRAVA?: string;
   HABIT_ID_WAKATIME?: string;
   HABIT_ID_KINDLE?: string;
+  HABIT_ID_KEYBR?: string;
   STRAVA_CLIENT_ID?: string;
   STRAVA_CLIENT_SECRET?: string;
   WAKATIME_API_KEY?: string;
   KINDLE_POSITIONS_PER_PAGE?: string;
   KINDLE_WORDS_PER_PAGE?: string;
   KINDLE_PAGE_COUNTS?: string;
+  KEYBR_PUBLIC_ID?: string;
 }
 
 export interface HabitValue {
