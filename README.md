@@ -410,7 +410,7 @@ Four pieces of automation live under `.github/`:
   generated integrations block (`npm run generate:readme-integrations`,
   checked by `test/readme-integrations.test.ts`) is kept honest the same way.
 - **Check** (`.github/workflows/check.yml`) runs `npm run typecheck`,
-  `npm test`, and `npm run preflight` on every push to `master` and on every
+  `npm test`, and `npm run preflight` on every push to `main` and on every
   pull request. Needs no repository secrets or variables.
 - **Dependabot** (`.github/dependabot.yml`) opens a monthly npm dependency
   update PR. `wrangler`, `@cloudflare/*`, and `vitest` are grouped into a
@@ -433,7 +433,7 @@ Four pieces of automation live under `.github/`:
 - **Deploy** (`.github/workflows/deploy.yml`) runs the typecheck and test
   suite, then preflight, then `npx wrangler deploy` — but only on a manual
   `workflow_dispatch`, triggered from the Actions tab, never on push or on
-  merge to `master`. This worker is somebody's daily habit tracking; a bad
+  merge to `main`. This worker is somebody's daily habit tracking; a bad
   merge auto-deploying on push would silently overwrite a live, working
   worker with no human review gate in between.
 
