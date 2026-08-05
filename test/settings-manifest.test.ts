@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { INTEGRATIONS } from "../src/integrations/registry";
 import { buildSettingsManifest } from "../src/settings";
 
-// Relative to this config's root (the repo root — see test/settings-manifest.vitest.config.ts).
+// Relative to this config's root (the repo root — see test/generated-artifacts.vitest.config.ts).
 const MANIFEST_PATH = "scripts/settings-manifest.json";
 
 describe("scripts/settings-manifest.json", () => {
