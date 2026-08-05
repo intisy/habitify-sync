@@ -1,5 +1,5 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import worker, { buildRouteTable, dispatch, handleFetch } from "../src/index";
 import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "../src/state";
 import type { Env, IntegrationRoute } from "../src/integrations/types";
@@ -329,6 +329,216 @@ describe("GET /journal", () => {
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain("500");
     expect(JSON.stringify(body)).not.toContain("habitify-key");
+  });
+});
+
+describe("GET /config", () => {
+  it("rejects requests without the admin token", async () => {
+    expect((await request("/config")).status).toBe(401);
+  });
+
+  it("lists every registered integration, redacting secrets to a configured boolean", async () => {
+    const response = await request("/config", { headers: bearer });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, { key: string; value?: string; configured?: boolean }[]>;
+    expect(Object.keys(body).sort()).toEqual(["keybr", "kindle", "strava", "wakatime"]);
+
+    const stravaClientId = body.strava.find((setting) => setting.key === "clientId")!;
+    expect(stravaClientId).not.toHaveProperty("value");
+    expect(typeof stravaClientId.configured).toBe("boolean");
+    expect(JSON.stringify(body)).not.toContain("client-secret");
+
+    const keybrPublicId = body.keybr.find((setting) => setting.key === "publicId")!;
+    expect(keybrPublicId).not.toHaveProperty("configured");
+    expect(typeof keybrPublicId.value).toBe("string");
+  });
+});
+
+describe("GET /config/<integration>", () => {
+  it("rejects requests without the admin token", async () => {
+    expect((await request("/config/keybr")).status).toBe(401);
+  });
+
+  it("returns 404 for an integration not in the registry", async () => {
+    expect((await request("/config/nonexistent", { headers: bearer })).status).toBe(404);
+  });
+
+  it("returns one integration's settings, habitId included", async () => {
+    const response = await request("/config/keybr", { headers: bearer });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { integration: string; settings: { key: string }[] };
+    expect(body.integration).toBe("keybr");
+    expect(body.settings.map((setting) => setting.key).sort()).toEqual(["habitId", "publicId"]);
+  });
+});
+
+describe("PUT /config/<integration>", () => {
+  afterEach(async () => {
+    await env.STATE.delete("config:keybr");
+    await env.STATE.delete("config:kindle");
+  });
+
+  it("rejects requests without the admin token", async () => {
+    const response = await request("/config/keybr", { method: "PUT", body: JSON.stringify({ publicId: "x" }) });
+    expect(response.status).toBe(401);
+  });
+
+  it("merges a valid override into KV and echoes it back", async () => {
+    const response = await request("/config/keybr", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ publicId: "overridden-id" }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { overrides: Record<string, string> };
+    expect(body.overrides.publicId).toBe("overridden-id");
+
+    const getResponse = await request("/config/keybr", { headers: bearer });
+    const settings = (await getResponse.json()) as { settings: { key: string; value?: string; source: string }[] };
+    const publicId = settings.settings.find((setting) => setting.key === "publicId")!;
+    expect(publicId).toMatchObject({ value: "overridden-id", source: "kv" });
+  });
+
+  it("rejects an unknown setting key, naming what is allowed", async () => {
+    const response = await request("/config/keybr", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ notARealSetting: "x" }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("notARealSetting");
+    expect(body.error).toContain("publicId");
+    expect(body.error).toContain("habitId");
+  });
+
+  it("rejects a secret key, naming how to configure it instead", async () => {
+    const response = await request("/config/strava", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId: "should-not-be-settable" }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("secret");
+    expect(body.error).toContain("STRAVA_CLIENT_ID");
+    const stored = await env.STATE.get("config:strava");
+    expect(stored).toBeNull();
+  });
+
+  it("rejects a non-numeric value for a number-typed setting", async () => {
+    const response = await request("/config/kindle", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ wordsPerPage: "not-a-number" }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("wordsPerPage");
+    expect(body.error).toContain("number");
+  });
+
+  it("rejects unparseable JSON for a json-typed setting", async () => {
+    const response = await request("/config/kindle", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ pageCounts: "not json" }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("pageCounts");
+    expect(body.error).toContain("JSON");
+  });
+
+  it("rejects a malformed request body", async () => {
+    const response = await request("/config/keybr", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: "not json",
+    });
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("DELETE /config/<integration>", () => {
+  afterEach(async () => {
+    await env.STATE.delete("config:keybr");
+  });
+
+  it("rejects requests without the admin token", async () => {
+    expect((await request("/config/keybr", { method: "DELETE" })).status).toBe(401);
+  });
+
+  it("clears a single override with ?key=, leaving the rest untouched", async () => {
+    await request("/config/keybr", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ publicId: "overridden-id", habitId: "overridden-habit" }),
+    });
+
+    const deleteResponse = await request("/config/keybr?key=publicId", { method: "DELETE", headers: bearer });
+    expect(deleteResponse.status).toBe(204);
+
+    const stored = await env.STATE.get("config:keybr");
+    expect(JSON.parse(stored!)).toEqual({ habitId: "overridden-habit" });
+  });
+
+  it("returns 400 naming valid keys when ?key= isn't a declared setting", async () => {
+    const response = await request("/config/keybr?key=nonexistent", { method: "DELETE", headers: bearer });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("nonexistent");
+  });
+
+  it("clears every override without ?key=", async () => {
+    await request("/config/keybr", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ publicId: "overridden-id" }),
+    });
+
+    const deleteResponse = await request("/config/keybr", { method: "DELETE", headers: bearer });
+    expect(deleteResponse.status).toBe(204);
+    expect(await env.STATE.get("config:keybr")).toBeNull();
+  });
+});
+
+describe("a PUT override changes what the next sync reads", () => {
+  afterEach(async () => {
+    await env.STATE.delete("config:keybr");
+    await env.STATE.delete(STATE_KEYS.sourceStatus("keybr"));
+  });
+
+  it("uses the KV-overridden publicId instead of KEYBR_PUBLIC_ID on the next sync", async () => {
+    await request("/config/keybr", {
+      method: "PUT",
+      headers: { ...bearer, "Content-Type": "application/json" },
+      body: JSON.stringify({ publicId: "overridden-id" }),
+    });
+
+    let requestedKeybrUrl: string | undefined;
+    // Header-only keybr history: signature 0x4B455942, version 2, no records.
+    const emptyKeybrHistory = Uint8Array.of(0x4b, 0x45, 0x59, 0x42, 0, 0, 0, 2);
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("keybr.com")) {
+        requestedKeybrUrl = url;
+        return new Response(emptyKeybrHistory, { status: 200 });
+      }
+      if (url.endsWith("/habits") && (init?.method ?? "GET") === "GET") {
+        return Response.json({ data: [] });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const response = await handleFetch(
+      new Request("https://worker.example/sync?source=keybr", { method: "POST", headers: bearer }),
+      authedEnv,
+      fetchFn,
+    );
+    expect(response.status).toBe(200);
+    expect(requestedKeybrUrl).toContain("overridden-id");
+    expect(requestedKeybrUrl).not.toContain("b23mgn5");
   });
 });
 

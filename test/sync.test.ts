@@ -5,7 +5,11 @@ import { readJson, STATE_KEYS, writeJson, type SourceStatus } from "../src/state
 import { AuthNeededError, type Env, type Integration } from "../src/integrations/types";
 
 const now = new Date("2026-08-04T10:00:00Z");
-const testEnv: Env = { ...env, HABITIFY_API_KEY: "habitify-key" };
+// HABIT_ID_GOOD/HABIT_ID_BROKEN are set so the fake "good"/"broken" sources below (which declare
+// no settings of their own) resolve enabled via the implicit habitId requirement — see
+// makeSource. HABIT_ID_OFF is deliberately left unset so a fake "off" source stays disabled
+// without needing its own explicit enabled() override (there is no such thing anymore).
+const testEnv: Env = { ...env, HABITIFY_API_KEY: "habitify-key", HABIT_ID_GOOD: "habit-good", HABIT_ID_BROKEN: "habit-broken" };
 
 interface RecordedRequest {
   method: string;
@@ -28,7 +32,7 @@ function fakeHabitify(recorded: RecordedRequest[], habitsResponse: unknown = { d
 }
 
 function makeSource(name: string, behavior: () => Promise<{ habitId: string; value: number; unit: string }[]>): Integration {
-  return { name, enabled: () => true, fetchToday: behavior };
+  return { name, settings: [], fetchToday: behavior };
 }
 
 describe("runSync", () => {
@@ -88,7 +92,9 @@ describe("runSync", () => {
     } satisfies SourceStatus);
     const disabled: Integration = {
       name: "off",
-      enabled: () => false,
+      // No HABIT_ID_OFF is set on testEnv, so the implicit habitId requirement is what keeps this
+      // source disabled — there is no explicit enabled() to override anymore.
+      settings: [],
       fetchToday: async () => {
         throw new Error("must not be called");
       },
@@ -170,8 +176,11 @@ describe("runSync - Habitify unit resolution", () => {
     const recorded: RecordedRequest[] = [];
     const source = makeSource("kindle-like", async () => [{ habitId: "habit-2", value: 40, unit: "pages" }]);
     const habitsResponse = { data: [{ id: "habit-2", goals: [] }] };
+    // "kindle-like" isn't in the shared testEnv above (unlike "good"/"broken"), so it needs its
+    // own habitId var to resolve enabled.
+    const kindleLikeEnv: Env = { ...testEnv, "HABIT_ID_KINDLE-LIKE": "habit-2" };
 
-    await runSync(testEnv, [source], now, fakeHabitify(recorded, habitsResponse));
+    await runSync(kindleLikeEnv, [source], now, fakeHabitify(recorded, habitsResponse));
 
     const logRequest = recorded.find((request) => request.url.endsWith("/habits/habit-2/logs"));
     expect(JSON.parse(logRequest!.body!).unitSymbol).toBe("rep");

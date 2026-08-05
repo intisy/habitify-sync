@@ -1,7 +1,16 @@
 import { HabitifyClient, HabitInputValidationError } from "./habitify";
 import { readJson, STATE_KEYS, type SourceStatus } from "./state";
 import { INTEGRATIONS } from "./integrations/registry";
-import type { AuthMode, Env, IntegrationRoute, RouteContext } from "./integrations/types";
+import type { AuthMode, Env, Integration, IntegrationRoute, RouteContext, SettingDescriptor } from "./integrations/types";
+import {
+  configKvKey,
+  deriveVariableName,
+  readConfigOverrides,
+  settingsForIntegration,
+  SettingsResolver,
+  writeConfigOverrides,
+  type ResolvedSetting,
+} from "./settings";
 import { runSync } from "./sync";
 
 // Query-param auth is honored only for routes declared "admin-or-query-token" (currently just
@@ -142,12 +151,192 @@ async function handleCreateHabit(request: Request, context: RouteContext): Promi
   }
 }
 
+// The shape GET /config and GET /config/<integration> report per setting: value/source/default/
+// description/type for discoverability, with secrets redacted to a boolean rather than ever
+// echoing the actual value — the asymmetry with non-secret settings (which do report `value`) is
+// the point, not an oversight.
+interface SettingSnapshot {
+  key: string;
+  type: SettingDescriptor["type"];
+  description: string;
+  required: boolean;
+  secret: boolean;
+  default?: string;
+  source: ResolvedSetting["source"];
+  value?: string;
+  configured?: boolean;
+}
+
+function snapshotSetting(resolved: ResolvedSetting): SettingSnapshot {
+  const { descriptor } = resolved;
+  const snapshot: SettingSnapshot = {
+    key: resolved.key,
+    type: descriptor.type,
+    description: descriptor.description,
+    required: Boolean(descriptor.required),
+    secret: Boolean(descriptor.secret),
+    default: descriptor.default,
+    source: resolved.source,
+  };
+  if (descriptor.secret) {
+    snapshot.configured = resolved.value !== undefined;
+  } else {
+    snapshot.value = resolved.value;
+  }
+  return snapshot;
+}
+
+async function resolvedSettingsFor(integration: Integration, env: Env): Promise<SettingSnapshot[]> {
+  const resolver = new SettingsResolver(env, env.STATE, integration.name, integration.settings);
+  return (await resolver.resolveAll()).map(snapshotSetting);
+}
+
+async function handleGetAllConfig(_request: Request, context: RouteContext): Promise<Response> {
+  const result: Record<string, SettingSnapshot[]> = {};
+  for (const integration of INTEGRATIONS) {
+    result[integration.name] = await resolvedSettingsFor(integration, context.env);
+  }
+  return Response.json(result);
+}
+
+async function handleGetIntegrationConfig(
+  integration: Integration,
+  _request: Request,
+  context: RouteContext,
+): Promise<Response> {
+  return Response.json({ integration: integration.name, settings: await resolvedSettingsFor(integration, context.env) });
+}
+
+// Validates a raw string value (the shape every wrangler.toml var and every KV override actually
+// is) against a setting's declared type — a `number` must parse finite, a `json` must parse at
+// all — so a bad value is rejected here rather than degrading silently the next time it's read.
+function settingValidationError(descriptor: SettingDescriptor, value: string): string | undefined {
+  if (descriptor.type === "number" && !Number.isFinite(Number(value))) {
+    return `"${descriptor.key}" must be a number, got ${JSON.stringify(value)}`;
+  }
+  if (descriptor.type === "json") {
+    try {
+      JSON.parse(value);
+    } catch (cause) {
+      return `"${descriptor.key}" must be valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`;
+    }
+  }
+  return undefined;
+}
+
+async function handlePutIntegrationConfig(
+  integration: Integration,
+  request: Request,
+  context: RouteContext,
+): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "request body must be valid JSON" }, { status: 400 });
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return Response.json(
+      { error: "request body must be a JSON object mapping setting key to string value" },
+      { status: 400 },
+    );
+  }
+  const descriptors = settingsForIntegration(integration);
+  const validKeys = descriptors.map((descriptor) => descriptor.key).join(", ");
+  const updates: Record<string, string> = {};
+  for (const [key, rawValue] of Object.entries(body as Record<string, unknown>)) {
+    const descriptor = descriptors.find((candidate) => candidate.key === key);
+    if (!descriptor) {
+      return Response.json(
+        { error: `unknown setting "${key}" for ${integration.name}; valid settings: ${validKeys}` },
+        { status: 400 },
+      );
+    }
+    if (descriptor.secret) {
+      return Response.json(
+        {
+          error:
+            `"${key}" is a secret and cannot be set through this API; configure it with ` +
+            `wrangler secret put ${deriveVariableName(integration.name, key)}`,
+        },
+        { status: 400 },
+      );
+    }
+    if (typeof rawValue !== "string") {
+      return Response.json({ error: `"${key}" must be a string value, got ${JSON.stringify(rawValue)}` }, { status: 400 });
+    }
+    const validationError = settingValidationError(descriptor, rawValue);
+    if (validationError) {
+      return Response.json({ error: validationError }, { status: 400 });
+    }
+    updates[key] = rawValue;
+  }
+  const existing = await readConfigOverrides(context.env.STATE, integration.name);
+  const merged = { ...existing, ...updates };
+  await writeConfigOverrides(context.env.STATE, integration.name, merged);
+  return Response.json({ integration: integration.name, overrides: merged });
+}
+
+async function handleDeleteIntegrationConfig(
+  integration: Integration,
+  request: Request,
+  context: RouteContext,
+): Promise<Response> {
+  const key = new URL(request.url).searchParams.get("key");
+  if (key) {
+    const descriptors = settingsForIntegration(integration);
+    if (!descriptors.some((descriptor) => descriptor.key === key)) {
+      return Response.json(
+        {
+          error: `unknown setting "${key}" for ${integration.name}; valid settings: ${descriptors
+            .map((descriptor) => descriptor.key)
+            .join(", ")}`,
+        },
+        { status: 400 },
+      );
+    }
+    const existing = await readConfigOverrides(context.env.STATE, integration.name);
+    delete existing[key];
+    await writeConfigOverrides(context.env.STATE, integration.name, existing);
+    return new Response(null, { status: 204 });
+  }
+  await context.env.STATE.delete(configKvKey(integration.name));
+  return new Response(null, { status: 204 });
+}
+
+// Generates the three config routes for one integration, derived entirely from the registry —
+// adding an integration never means adding a route here by hand.
+function buildConfigRoutesForIntegration(integration: Integration): IntegrationRoute[] {
+  return [
+    {
+      method: "GET",
+      path: `/config/${integration.name}`,
+      auth: "admin",
+      handler: (request, context) => handleGetIntegrationConfig(integration, request, context),
+    },
+    {
+      method: "PUT",
+      path: `/config/${integration.name}`,
+      auth: "admin",
+      handler: (request, context) => handlePutIntegrationConfig(integration, request, context),
+    },
+    {
+      method: "DELETE",
+      path: `/config/${integration.name}`,
+      auth: "admin",
+      handler: (request, context) => handleDeleteIntegrationConfig(integration, request, context),
+    },
+  ];
+}
+
 const CORE_ROUTES: IntegrationRoute[] = [
   { method: "POST", path: "/sync", auth: "admin", handler: handleSync },
   { method: "GET", path: "/status", auth: "admin", handler: (_request, context) => handleStatus(context.env) },
   { method: "GET", path: "/habits", auth: "admin", handler: handleListHabits },
   { method: "POST", path: "/habits", auth: "admin", handler: handleCreateHabit },
   { method: "GET", path: "/journal", auth: "admin", handler: handleJournal },
+  { method: "GET", path: "/config", auth: "admin", handler: handleGetAllConfig },
+  ...INTEGRATIONS.flatMap((integration) => buildConfigRoutesForIntegration(integration)),
 ];
 
 // Builds a lookup table keyed by "METHOD path" from a flat list of routes (core routes plus
@@ -185,16 +374,32 @@ function withNoStore(response: Response): Response {
   });
 }
 
+// A route's settings resolver is scoped to whichever integration owns it (via routeOwners, built
+// from each integration's own `routes` array — see ROUTE_OWNERS below), never to a name the
+// handler picks itself. A route with no owner (every CORE_ROUTES entry) gets a resolver with no
+// declared settings; harmless, since none of those handlers read context.settings.
+function buildRouteContext(
+  route: IntegrationRoute,
+  env: Env,
+  fetchFn: typeof fetch,
+  routeOwners: ReadonlyMap<IntegrationRoute, Integration>,
+): RouteContext {
+  const owner = routeOwners.get(route);
+  const settings = new SettingsResolver(env, env.STATE, owner?.name ?? "", owner?.settings ?? []);
+  return { env, fetchFn, settings };
+}
+
 export async function dispatch(
   routeTable: Map<string, IntegrationRoute>,
   request: Request,
   env: Env,
   fetchFn: typeof fetch,
+  routeOwners: ReadonlyMap<IntegrationRoute, Integration> = new Map(),
 ): Promise<Response> {
   const url = new URL(request.url);
   const route = routeTable.get(`${request.method} ${url.pathname}`);
   if (route?.auth === "public") {
-    return withNoStore(await route.handler(request, { env, fetchFn }));
+    return withNoStore(await route.handler(request, buildRouteContext(route, env, fetchFn, routeOwners)));
   }
   // A route that isn't registered is treated as requiring the strictest auth (bearer token
   // only, no query fallback), so probing for routes without a token gets the same 401 a real
@@ -205,13 +410,23 @@ export async function dispatch(
   if (!route) {
     return withNoStore(Response.json({ error: "not found" }, { status: 404 }));
   }
-  return withNoStore(await route.handler(request, { env, fetchFn }));
+  return withNoStore(await route.handler(request, buildRouteContext(route, env, fetchFn, routeOwners)));
 }
 
 const ROUTE_TABLE = buildRouteTable([
   ...CORE_ROUTES,
   ...INTEGRATIONS.flatMap((integration) => integration.routes ?? []),
 ]);
+
+// Maps each integration-contributed route back to the integration that declared it, so dispatch
+// can scope that route's settings resolver correctly (see buildRouteContext above) without any
+// route hand-declaring its own owner.
+const ROUTE_OWNERS = new Map<IntegrationRoute, Integration>();
+for (const integration of INTEGRATIONS) {
+  for (const route of integration.routes ?? []) {
+    ROUTE_OWNERS.set(route, integration);
+  }
+}
 
 // Takes an injectable fetchFn (defaulted to the global fetch) so tests can exercise the Strava
 // code exchange and /sync route without hitting the network. Bound to globalThis so the default
@@ -224,7 +439,7 @@ export async function handleFetch(
   env: Env,
   fetchFn: typeof fetch = fetch.bind(globalThis),
 ): Promise<Response> {
-  return dispatch(ROUTE_TABLE, request, env, fetchFn);
+  return dispatch(ROUTE_TABLE, request, env, fetchFn, ROUTE_OWNERS);
 }
 
 export default {
