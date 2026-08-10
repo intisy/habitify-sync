@@ -18,8 +18,8 @@ if it ever drifts from the live registry, so it never needs hand-editing.
 
 | Key | Derived variable | Type | Required | Secret | Default | Description |
 |---|---|---|---|---|---|---|
-| `clientId` | `STRAVA_CLIENT_ID` | string | yes | yes | — | Strava OAuth application client id, from strava.com/settings/api. |
-| `clientSecret` | `STRAVA_CLIENT_SECRET` | string | yes | yes | — | Strava OAuth application client secret, from strava.com/settings/api. |
+| `clientId` | `STRAVA_CLIENT_ID` | string | no | yes | — | Strava OAuth application client id, from strava.com/settings/api. Not needed when using a web session. |
+| `clientSecret` | `STRAVA_CLIENT_SECRET` | string | no | yes | — | Strava OAuth application client secret, from strava.com/settings/api. Not needed when using a web session. |
 | `habitId` | `HABIT_ID_STRAVA` | string | yes | no | — | Habitify habit id this integration logs into. |
 
 ### [wakatime](src/integrations/wakatime/README.md)

@@ -4,17 +4,17 @@
       "key": "clientId",
       "variableName": "STRAVA_CLIENT_ID",
       "type": "string",
-      "required": true,
+      "required": false,
       "secret": true,
-      "description": "Strava OAuth application client id, from strava.com/settings/api."
+      "description": "Strava OAuth application client id, from strava.com/settings/api. Not needed when using a web session."
     },
     {
       "key": "clientSecret",
       "variableName": "STRAVA_CLIENT_SECRET",
       "type": "string",
-      "required": true,
+      "required": false,
       "secret": true,
-      "description": "Strava OAuth application client secret, from strava.com/settings/api."
+      "description": "Strava OAuth application client secret, from strava.com/settings/api. Not needed when using a web session."
     },
     {
       "key": "habitId",
