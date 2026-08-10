@@ -412,11 +412,6 @@ Four pieces of automation live under `.github/`:
 - **Check** (`.github/workflows/check.yml`) runs `npm run typecheck`,
   `npm test`, and `npm run preflight` on every push to `main` and on every
   pull request. Needs no repository secrets or variables.
-- **Dependabot** (`.github/dependabot.yml`) opens a monthly npm dependency
-  update PR. `wrangler`, `@cloudflare/*`, and `vitest` are grouped into a
-  single PR rather than three, because that trio has broken installs here
-  before with conflicting peer ranges — one PR that CI can prove installs
-  and passes together beats three that each half-satisfy the others.
 - **Monitor** (`.github/workflows/monitor.yml`) calls `GET /status` daily at
   07:00 UTC and fails the run (which GitHub emails to the repo owner) if any
   source reports `"error"` or `"auth_needed"` — e.g. after the Kindle cookie
