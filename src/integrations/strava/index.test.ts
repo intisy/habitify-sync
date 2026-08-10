@@ -21,15 +21,54 @@ function stravaEnv(): Env {
 describe("stravaIntegration.fetchToday", () => {
   beforeEach(async () => {
     await env.STATE.delete(STRAVA_STATE_KEYS.tokens);
+    await env.STATE.delete(STRAVA_STATE_KEYS.session);
   });
 
-  it("is disabled without client credentials and habit id", async () => {
-    const missingClientId: Env = { ...stravaEnv(), STRAVA_CLIENT_ID: undefined };
-    expect(await new SettingsResolver(missingClientId, missingClientId.STATE, "strava", stravaIntegration.settings).isEnabled()).toBe(
+  it("is enabled by habit id alone, since either auth path can supply the rest", async () => {
+    const noHabitId: Env = { ...stravaEnv(), HABIT_ID_STRAVA: undefined };
+    expect(await new SettingsResolver(noHabitId, noHabitId.STATE, "strava", stravaIntegration.settings).isEnabled()).toBe(
       false,
     );
-    const complete = stravaEnv();
-    expect(await new SettingsResolver(complete, complete.STATE, "strava", stravaIntegration.settings).isEnabled()).toBe(true);
+
+    const habitIdOnly: Env = { ...env, HABIT_ID_STRAVA: "habit-s" };
+    expect(
+      await new SettingsResolver(habitIdOnly, habitIdOnly.STATE, "strava", stravaIntegration.settings).isEnabled(),
+    ).toBe(true);
+  });
+
+  it("prefers the web session over stored OAuth tokens", async () => {
+    await writeJson(env.STATE, STRAVA_STATE_KEYS.tokens, {
+      accessToken: "access",
+      refreshToken: "refresh",
+      expiresAt: 9999999999,
+    } satisfies StravaTokens);
+    await writeJson(env.STATE, STRAVA_STATE_KEYS.session, {
+      cookie: "_strava4_session=abc",
+      updatedAt: "2026-08-04T00:00:00.000Z",
+    });
+
+    const urls: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return Response.json({
+        models: [{ moving_time_raw: 1800, start_date_local_raw: Date.parse("2026-08-04T06:00:00Z") / 1000 }],
+      });
+    }) as typeof fetch;
+
+    const values = await stravaIntegration.fetchToday(makeContext(stravaEnv(), fetchFn));
+
+    expect(urls[0]).toContain("/athlete/training_activities");
+    expect(urls.some((url) => url.includes("/api/v3/"))).toBe(false);
+    expect(values[0].value).toBe(30);
+    expect(values[0].diagnostics).toMatchObject({ reader: "web", activitiesCounted: 1 });
+  });
+
+  it("throws AuthNeededError naming both paths when neither is configured", async () => {
+    const bare: Env = { ...env, HABIT_ID_STRAVA: "habit-s" };
+    const fetchFn = (async () => new Response("{}")) as typeof fetch;
+    await expect(stravaIntegration.fetchToday(makeContext(bare, fetchFn))).rejects.toThrow(AuthNeededError);
+    await expect(stravaIntegration.fetchToday(makeContext(bare, fetchFn))).rejects.toThrow(/\/strava\/session/);
+    await expect(stravaIntegration.fetchToday(makeContext(bare, fetchFn))).rejects.toThrow(/\/strava\/authorize/);
   });
 
   it("throws AuthNeededError when no tokens are stored", async () => {
@@ -62,7 +101,7 @@ describe("stravaIntegration.fetchToday", () => {
     expect(requests[1].url).toBe(
       `https://www.strava.com/api/v3/athlete/activities?after=${berlinMidnightEpoch}&per_page=100`,
     );
-    expect(values).toEqual([{ habitId: "habit-s", value: 45, unit: "min" }]);
+    expect(values).toEqual([{ habitId: "habit-s", value: 45, unit: "min", diagnostics: { reader: "api" } }]);
 
     const stored = await readJson<StravaTokens>(env.STATE, STRAVA_STATE_KEYS.tokens);
     expect(stored?.refreshToken).toBe("new-refresh");
