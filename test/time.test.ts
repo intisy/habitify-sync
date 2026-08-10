@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { localMidnightEpochSeconds, todayInTimeZone } from "../src/time";
+import { localMidnightEpochSeconds, naiveLocalMidnightEpochSeconds, todayInTimeZone } from "../src/time";
 
 describe("todayInTimeZone", () => {
   it("returns the local date for Europe/Berlin", () => {
@@ -30,5 +30,34 @@ describe("localMidnightEpochSeconds", () => {
   it("returns correct offset on fall-back DST transition day", () => {
     const epoch = localMidnightEpochSeconds("Europe/Berlin", new Date("2026-10-25T12:00:00Z"));
     expect(epoch).toBe(Date.parse("2026-10-24T22:00:00Z") / 1000);
+  });
+});
+
+describe("naiveLocalMidnightEpochSeconds", () => {
+  it("returns local midnight as a naive epoch, unshifted by the zone offset", () => {
+    const now = new Date("2026-08-04T10:00:00Z");
+    expect(naiveLocalMidnightEpochSeconds("Europe/Berlin", now)).toBe(Date.parse("2026-08-04T00:00:00Z") / 1000);
+  });
+
+  it("leads localMidnightEpochSeconds by the summer offset", () => {
+    const now = new Date("2026-08-04T10:00:00Z");
+    expect(naiveLocalMidnightEpochSeconds("Europe/Berlin", now) - localMidnightEpochSeconds("Europe/Berlin", now)).toBe(
+      2 * 3600,
+    );
+  });
+
+  it("leads localMidnightEpochSeconds by the winter offset", () => {
+    const now = new Date("2026-01-15T10:00:00Z");
+    expect(naiveLocalMidnightEpochSeconds("Europe/Berlin", now) - localMidnightEpochSeconds("Europe/Berlin", now)).toBe(
+      3600,
+    );
+  });
+
+  it("trails localMidnightEpochSeconds in a negative-offset zone", () => {
+    const now = new Date("2026-08-04T16:00:00Z");
+    expect(naiveLocalMidnightEpochSeconds("America/New_York", now)).toBe(Date.parse("2026-08-04T00:00:00Z") / 1000);
+    expect(
+      naiveLocalMidnightEpochSeconds("America/New_York", now) - localMidnightEpochSeconds("America/New_York", now),
+    ).toBe(-4 * 3600);
   });
 });

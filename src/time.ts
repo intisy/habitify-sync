@@ -43,3 +43,11 @@ export function localMidnightEpochSeconds(timeZone: string, now: Date): number {
   const offsetMinutes = offsetMinutesAtLocalTime(timeZone, `${today}T00:00:00`);
   return utcMidnightMs / 1000 - offsetMinutes * 60;
 }
+
+// The boundary for a timestamp that is ALREADY offset-shifted — naive local time rendered as an
+// epoch, which is what Strava's web JSON emits as start_date_local_raw. Comparing such a value
+// against localMidnightEpochSeconds above would be wrong by exactly the zone's UTC offset, silently
+// dropping or admitting early-morning activities rather than failing.
+export function naiveLocalMidnightEpochSeconds(timeZone: string, now: Date): number {
+  return Date.parse(`${todayInTimeZone(timeZone, now)}T00:00:00Z`) / 1000;
+}
