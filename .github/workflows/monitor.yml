@@ -34,13 +34,12 @@ jobs:
           unhealthy=$(echo "$status_body" | jq -r '
             to_entries
             | map(select(.value != null and (.value.state == "error" or .value.state == "auth_needed")))
-            | map("\(.key): \(.value.state) — \(.value.lastError // "no message")")
-            | join("\n")
+            | map("\(.key): \(.value.state) (\(.value.lastError // "no message"))")
+            | join("; ")
           ')
 
           if [ -n "$unhealthy" ]; then
-            echo "::error::Unhealthy sources:"
-            echo "$unhealthy"
+            echo "::error::Unhealthy sources: $unhealthy"
             exit 1
           fi
 
